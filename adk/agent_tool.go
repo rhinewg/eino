@@ -228,7 +228,7 @@ func (at *agentTool) InvokableRun(ctx context.Context, argumentsInJSON string, o
 			if err != nil {
 				return "", err
 			}
-			ret = msg.Content
+			ret = msg.AssistantTextContent()
 		}
 	}
 

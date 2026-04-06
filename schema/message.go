@@ -686,6 +686,33 @@ type Message struct {
 	Extra map[string]any `json:"extra,omitempty"`
 }
 
+// AssistantTextContent returns assistant-visible text: Content plus text segments from
+// AssistantGenMultiContent, with deprecated MultiContent as fallback when the former is empty.
+// Used when wrapping sub-agents as tools so replies are not dropped when the model fills only structured output fields.
+func (m *Message) AssistantTextContent() string {
+	if m == nil {
+		return ""
+	}
+	var b strings.Builder
+	if m.Content != "" {
+		b.WriteString(m.Content)
+	}
+	if len(m.AssistantGenMultiContent) > 0 {
+		for _, part := range m.AssistantGenMultiContent {
+			if part.Type == ChatMessagePartTypeText && part.Text != "" {
+				b.WriteString(part.Text)
+			}
+		}
+	} else if len(m.MultiContent) > 0 {
+		for _, part := range m.MultiContent {
+			if part.Type == ChatMessagePartTypeText && part.Text != "" {
+				b.WriteString(part.Text)
+			}
+		}
+	}
+	return b.String()
+}
+
 // TokenUsage Represents the token usage of chat model request.
 type TokenUsage struct {
 	// PromptTokens is the number of prompt tokens, including all the input tokens of this request.
