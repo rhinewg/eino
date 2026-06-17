@@ -18,6 +18,7 @@ package filesystem
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -92,7 +93,9 @@ type Config struct {
 	// LsToolConfig configures the ls tool
 	// optional
 	LsToolConfig *ToolConfig
-	// ReadFileToolConfig configures the read_file tool
+	// ReadFileToolConfig configures the read_file tool.
+	// This config applies to both the standard read_file tool (InvokableTool) and
+	// the multimodal read_file tool (EnhancedInvokableTool) when UseMultiModalRead is true.
 	// optional
 	ReadFileToolConfig *ToolConfig
 	// WriteFileToolConfig configures the write_file tool
@@ -233,7 +236,9 @@ type MiddlewareConfig struct {
 	// LsToolConfig configures the ls tool
 	// optional
 	LsToolConfig *ToolConfig
-	// ReadFileToolConfig configures the read_file tool
+	// ReadFileToolConfig configures the read_file tool.
+	// This config applies to both the standard read_file tool (InvokableTool) and
+	// the multimodal read_file tool (EnhancedInvokableTool) when UseMultiModalRead is true.
 	// optional
 	ReadFileToolConfig *ToolConfig
 	// WriteFileToolConfig configures the write_file tool
@@ -248,6 +253,24 @@ type MiddlewareConfig struct {
 	// GrepToolConfig configures the grep tool
 	// optional
 	GrepToolConfig *ToolConfig
+
+	// UseMultiModalRead enables multimodal read_file tool (EnhancedInvokableTool).
+	// When true, read_file returns results via schema.ToolResult.Parts instead of plain text string.
+	//
+	// Requires Backend to implement filesystem.MultiModalReader interface.
+	// The default implementation supports reading image files (PNG, JPG, etc.)
+	// and PDF files with page range selection.
+	//
+	// If you provide a custom MultiModalReader, you may need to override
+	// ReadFileToolConfig.Desc to accurately describe your implementation's capabilities.
+	// The default description is composed of ReadFileToolDesc + EnhancedReadFileDescSuffix.
+	//
+	// Note: When enabled, the read_file tool becomes an EnhancedInvokableTool.
+	// If you use ChatModelAgentMiddleware, you must implement ChatModelAgentMiddleware.WrapEnhancedInvokableToolCall
+	// for the middleware to take effect on the read_file tool.
+	//
+	// Default false, preserving backward compatibility.
+	UseMultiModalRead bool
 
 	// CustomSystemPrompt overrides the default ToolsSystemPrompt appended to agent instruction
 	// optional, ToolsSystemPrompt by default
@@ -318,6 +341,38 @@ func (c *MiddlewareConfig) mergeToolConfigWithDesc(
 	return toolConfig
 }
 
+// NewTyped constructs and returns the filesystem middleware as a TypedChatModelAgentMiddleware[M].
+//
+// This is the generic constructor that supports both *schema.Message and *schema.AgenticMessage.
+// It returns a TypedChatModelAgentMiddleware[M] which provides:
+//   - Better context propagation through WrapInvokableToolCall and WrapStreamableToolCall methods
+//   - BeforeAgent hook for modifying agent instruction and tools at runtime
+//   - More flexible extension points compared to the struct-based AgentMiddleware
+//
+// The middleware provides filesystem tools (ls, read_file, write_file, edit_file, glob, grep)
+// and optionally an execute tool if the Backend implements ShellBackend or StreamingShellBackend.
+func NewTyped[M adk.MessageType](ctx context.Context, config *MiddlewareConfig) (adk.TypedChatModelAgentMiddleware[M], error) {
+	err := config.Validate()
+	if err != nil {
+		return nil, err
+	}
+	ts, err := getFilesystemTools(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+	var systemPrompt string
+	if config.CustomSystemPrompt != nil {
+		systemPrompt = *config.CustomSystemPrompt
+	}
+
+	m := &typedFilesystemMiddleware[M]{
+		additionalInstruction: systemPrompt,
+		additionalTools:       ts,
+	}
+
+	return m, nil
+}
+
 // New constructs and returns the filesystem middleware as a ChatModelAgentMiddleware.
 //
 // This is the recommended constructor for new code. It returns a ChatModelAgentMiddleware which provides:
@@ -338,34 +393,16 @@ func (c *MiddlewareConfig) mergeToolConfigWithDesc(
 //	    Handlers: []adk.ChatModelAgentMiddleware{middleware},
 //	})
 func New(ctx context.Context, config *MiddlewareConfig) (adk.ChatModelAgentMiddleware, error) {
-	err := config.Validate()
-	if err != nil {
-		return nil, err
-	}
-	ts, err := getFilesystemTools(ctx, config)
-	if err != nil {
-		return nil, err
-	}
-	var systemPrompt string
-	if config.CustomSystemPrompt != nil {
-		systemPrompt = *config.CustomSystemPrompt
-	}
-
-	m := &filesystemMiddleware{
-		additionalInstruction: systemPrompt,
-		additionalTools:       ts,
-	}
-
-	return m, nil
+	return NewTyped[*schema.Message](ctx, config)
 }
 
-type filesystemMiddleware struct {
-	adk.BaseChatModelAgentMiddleware
+type typedFilesystemMiddleware[M adk.MessageType] struct {
+	*adk.TypedBaseChatModelAgentMiddleware[M]
 	additionalInstruction string
 	additionalTools       []tool.BaseTool
 }
 
-func (m *filesystemMiddleware) BeforeAgent(ctx context.Context, runCtx *adk.ChatModelAgentContext) (context.Context, *adk.ChatModelAgentContext, error) {
+func (m *typedFilesystemMiddleware[M]) BeforeAgent(ctx context.Context, runCtx *adk.ChatModelAgentContext) (context.Context, *adk.ChatModelAgentContext, error) {
 	if runCtx == nil {
 		return ctx, runCtx, nil
 	}
@@ -406,6 +443,9 @@ func getFilesystemTools(_ context.Context, middlewareConfig *MiddlewareConfig) (
 			legacyDesc: middlewareConfig.CustomReadFileToolDesc,
 			createFunc: func(name, desc string) (tool.BaseTool, error) {
 				if middlewareConfig.Backend != nil {
+					if middlewareConfig.UseMultiModalRead {
+						return newMultiModalReadFileTool(middlewareConfig.Backend, name, desc)
+					}
 					return newReadFileTool(middlewareConfig.Backend, name, desc)
 				}
 				return nil, nil
@@ -554,6 +594,14 @@ type readFileArgs struct {
 	Limit int `json:"limit" jsonschema:"description=The number of lines to read. Only provide if the file is too large to read at once."`
 }
 
+// multiModalReadFileArgs extends readFileArgs with PDF-specific parameters for MultiModalReadFileTool.
+type multiModalReadFileArgs struct {
+	readFileArgs
+
+	// Pages is the page range for PDF files.
+	Pages string `json:"pages,omitempty" jsonschema:"description=Page range for PDF files (e.g.\\, \"1-5\"\\, \"3\"\\, \"10-20\"). Only applicable to PDF files. Maximum 20 pages per request."`
+}
+
 func newReadFileTool(fs filesystem.Backend, name string, desc string) (tool.BaseTool, error) {
 	toolName := selectToolName(name, ToolNameReadFile)
 	d, err := selectToolDesc(desc, ReadFileToolDesc, ReadFileToolDescChinese)
@@ -564,6 +612,9 @@ func newReadFileTool(fs filesystem.Backend, name string, desc string) (tool.Base
 		if input.Offset <= 0 {
 			input.Offset = 1
 		}
+		if input.Limit <= 0 {
+			input.Limit = 2000
+		}
 
 		fileCt, err := fs.Read(ctx, &filesystem.ReadRequest{
 			FilePath: input.FilePath,
@@ -573,19 +624,163 @@ func newReadFileTool(fs filesystem.Backend, name string, desc string) (tool.Base
 		if err != nil {
 			return "", err
 		}
-
-		startLine := input.Offset
-		lines := strings.Split(fileCt.Content, "\n")
-		var b strings.Builder
-		for i, line := range lines {
-			if i < len(lines)-1 {
-				fmt.Fprintf(&b, "%6d\t%s\n", startLine+i, line)
-			} else {
-				fmt.Fprintf(&b, "%6d\t%s", startLine+i, line)
-			}
-
+		if fileCt == nil {
+			return fmt.Sprintf("No content found at path: %s", input.FilePath), nil
 		}
-		return b.String(), nil
+
+		return formatLineNumbers(fileCt.Content, input.Offset), nil
+	})
+}
+
+// formatLineNumbers prefixes each line of content with a 1-based line number
+// starting at startLine (e.g. "     1\tfoo"). startLine corresponds to the
+// line number of the first line in content (usually ReadRequest.Offset).
+func formatLineNumbers(content string, startLine int) string {
+	lines := strings.Split(content, "\n")
+	var b strings.Builder
+	for i, line := range lines {
+		if i < len(lines)-1 {
+			fmt.Fprintf(&b, "%6d\t%s\n", startLine+i, line)
+		} else {
+			fmt.Fprintf(&b, "%6d\t%s", startLine+i, line)
+		}
+	}
+	return b.String()
+}
+
+const maxPagesPerRequest = 20
+
+func validatePages(pages string) error {
+	parts := strings.SplitN(pages, "-", 2)
+	start, err := strconv.Atoi(parts[0])
+	if err != nil || start < 1 {
+		return fmt.Errorf("invalid pages parameter %q: expected format like \"3\" or \"1-10\"", pages)
+	}
+	if len(parts) == 1 {
+		return nil
+	}
+	if parts[1] == "" {
+		return fmt.Errorf("invalid pages parameter %q: expected format like \"3\" or \"1-10\"", pages)
+	}
+	end, err := strconv.Atoi(parts[1])
+	if err != nil || end < 1 {
+		return fmt.Errorf("invalid pages parameter %q: expected format like \"3\" or \"1-10\"", pages)
+	}
+	if end < start {
+		return fmt.Errorf("invalid pages parameter %q: end page must be >= start page", pages)
+	}
+	if end-start+1 > maxPagesPerRequest {
+		return fmt.Errorf("invalid pages parameter %q: range exceeds maximum of %d pages per request", pages, maxPagesPerRequest)
+	}
+	return nil
+}
+
+func newMultiModalReadFileTool(fs filesystem.Backend, name string, desc string) (tool.BaseTool, error) {
+	er, ok := fs.(filesystem.MultiModalReader)
+	if !ok {
+		return nil, fmt.Errorf("UseMultiModalRead is enabled, but backend (type %T) does not implement filesystem.MultiModalReader interface. "+
+			"Either implement the MultiModalReader interface on your backend, or set UseMultiModalRead to false", fs)
+	}
+	toolName := selectToolName(name, ToolNameReadFile)
+	d, err := selectToolDesc(desc, ReadFileToolDesc, ReadFileToolDescChinese)
+	if err != nil {
+		return nil, err
+	}
+	// Only append the multimodal suffix when falling back to the built-in desc.
+	// A custom desc is expected to describe its own capabilities, so appending
+	// would produce duplicated or contradictory descriptions.
+	if desc == "" {
+		d += internal.SelectPrompt(internal.I18nPrompts{
+			English: EnhancedReadFileDescSuffix,
+			Chinese: EnhancedReadFileDescSuffixChinese,
+		})
+	}
+
+	return utils.InferEnhancedTool(toolName, d, func(ctx context.Context, input multiModalReadFileArgs) (*schema.ToolResult, error) {
+		if input.Offset <= 0 {
+			input.Offset = 1
+		}
+		if input.Limit <= 0 {
+			input.Limit = 2000
+		}
+
+		if input.Pages != "" {
+			if err := validatePages(input.Pages); err != nil {
+				return &schema.ToolResult{
+					Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: err.Error()}},
+				}, nil
+			}
+		}
+
+		fileCt, err := er.MultiModalRead(ctx, &filesystem.MultiModalReadRequest{
+			ReadRequest: filesystem.ReadRequest{
+				FilePath: input.FilePath,
+				Offset:   input.Offset,
+				Limit:    input.Limit,
+			},
+			Pages: input.Pages,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		if fileCt == nil {
+			return &schema.ToolResult{
+				Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: fmt.Sprintf("No content found at path: %s", input.FilePath)}},
+			}, nil
+		}
+
+		// Multimodal result: convert FileContentPart to ToolOutputPart
+		if len(fileCt.Parts) > 0 {
+			parts := make([]schema.ToolOutputPart, 0, len(fileCt.Parts))
+			enc := base64Encoder{}
+			for _, p := range fileCt.Parts {
+				if len(p.Data) == 0 {
+					return nil, fmt.Errorf("FileContentPart.Data is empty for type %s", p.Type)
+				}
+				if p.MIMEType == "" {
+					return nil, fmt.Errorf("FileContentPart.MIMEType is empty for type %s", p.Type)
+				}
+				b64 := enc.encode(p.Data)
+				switch p.Type {
+				case filesystem.FileContentPartTypeImage:
+					parts = append(parts, schema.ToolOutputPart{
+						Type: schema.ToolPartTypeImage,
+						Image: &schema.ToolOutputImage{
+							MessagePartCommon: schema.MessagePartCommon{
+								MIMEType:   p.MIMEType,
+								Base64Data: &b64,
+							},
+						},
+					})
+				case filesystem.FileContentPartTypePDF:
+					parts = append(parts, schema.ToolOutputPart{
+						Type: schema.ToolPartTypeFile,
+						File: &schema.ToolOutputFile{
+							MessagePartCommon: schema.MessagePartCommon{
+								MIMEType:   p.MIMEType,
+								Base64Data: &b64,
+							},
+						},
+					})
+				default:
+					// FileContentPartType is defined by Backend implementations.
+					// Unrecognized types are unlikely but should fail explicitly rather than silently.
+					return nil, fmt.Errorf("unsupported FileContentPartType: %s", p.Type)
+				}
+			}
+			return &schema.ToolResult{Parts: parts}, nil
+		}
+
+		if fileCt.FileContent == nil {
+			return &schema.ToolResult{
+				Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: fmt.Sprintf("No content found at path: %s", input.FilePath)}},
+			}, nil
+		}
+
+		return &schema.ToolResult{
+			Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: formatLineNumbers(fileCt.Content, input.Offset)}},
+		}, nil
 	})
 }
 
@@ -915,6 +1110,22 @@ func valueOrDefault[T any](ptr *T, defaultValue T) T {
 		return *ptr
 	}
 	return defaultValue
+}
+
+// base64Encoder reuses a buffer across multiple base64 encoding calls to reduce allocations.
+type base64Encoder struct {
+	buf []byte
+}
+
+func (e *base64Encoder) encode(data []byte) string {
+	n := base64.StdEncoding.EncodedLen(len(data))
+	if cap(e.buf) < n {
+		e.buf = make([]byte, n)
+	} else {
+		e.buf = e.buf[:n]
+	}
+	base64.StdEncoding.Encode(e.buf, data)
+	return string(e.buf)
 }
 
 func applyPagination[T any](items []T, offset, headLimit int) []T {

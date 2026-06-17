@@ -19,7 +19,9 @@ package reduction
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 
@@ -31,6 +33,26 @@ import (
 	"github.com/cloudwego/eino/components/tool/utils"
 	"github.com/cloudwego/eino/schema"
 )
+
+func testTruncOffloadPath(root string) func(context.Context, *ToolDetail) (string, error) {
+	return func(_ context.Context, detail *ToolDetail) (string, error) {
+		callID := "generated"
+		if detail != nil && detail.ToolContext != nil && detail.ToolContext.CallID != "" {
+			callID = detail.ToolContext.CallID
+		}
+		return fmt.Sprintf("%s/trunc/%s", root, callID), nil
+	}
+}
+
+func testClearOffloadPath(root string) func(context.Context, *ToolDetail) (string, error) {
+	return func(_ context.Context, detail *ToolDetail) (string, error) {
+		callID := "generated"
+		if detail != nil && detail.ToolContext != nil && detail.ToolContext.CallID != "" {
+			callID = detail.ToolContext.CallID
+		}
+		return fmt.Sprintf("%s/clear/%s", root, callID), nil
+	}
+}
 
 func TestReductionMiddlewareTrunc(t *testing.T) {
 	ctx := context.Background()
@@ -49,14 +71,14 @@ func TestReductionMiddlewareTrunc(t *testing.T) {
 				"mock_invokable_tool": {
 					Backend:        backend,
 					SkipTruncation: false,
-					TruncHandler:   defaultTruncHandler("/tmp", 70),
+					TruncHandler:   defaultTruncHandler(testTruncOffloadPath("/tmp"), 70),
 				},
 			},
 		}
 
 		mw, err := New(ctx, config)
 		assert.NoError(t, err)
-		exp := "hello worldhello worldhello worldhello worldhello worldhello worldhell<persisted-output>\nOutput too large (199). Full output saved to: /tmp/trunc/12345\nPreview (first 35):\nhello worldhello worldhello worldhe\n\nPreview (last 35):\nldhello worldhello worldhello world\n\n</persisted-output>"
+		exp := "<persisted-output>\nOutput too large (199). Full output saved to: /tmp/trunc/12345\nPreview (first 35):\nhello worldhello worldhello worldhe\n\nPreview (last 35):\nldhello worldhello worldhello world\n\n</persisted-output>"
 
 		edp, err := mw.WrapInvokableToolCall(ctx, it.InvokableRun, tCtx)
 		assert.NoError(t, err)
@@ -82,13 +104,13 @@ hello worldhello worldhello worldhello worldhello worldhello worldhello worldhel
 				"mock_streamable_tool": {
 					Backend:        backend,
 					SkipTruncation: false,
-					TruncHandler:   defaultTruncHandler("/tmp", 70),
+					TruncHandler:   defaultTruncHandler(testTruncOffloadPath("/tmp"), 70),
 				},
 			},
 		}
 		mw, err := New(ctx, config)
 		assert.NoError(t, err)
-		exp := "hello worldhello worldhello worldhello worldhello worldhello worldhell<persisted-output>\nOutput too large (199). Full output saved to: /tmp/trunc/54321\nPreview (first 35):\nhello worldhello worldhello worldhe\n\nPreview (last 35):\nldhello worldhello worldhello world\n\n</persisted-output>"
+		exp := "<persisted-output>\nOutput too large (199). Full output saved to: /tmp/trunc/54321\nPreview (first 35):\nhello worldhello worldhello worldhe\n\nPreview (last 35):\nldhello worldhello worldhello world\n\n</persisted-output>"
 
 		edp, err := mw.WrapStreamableToolCall(ctx, st.StreamableRun, tCtx)
 		assert.NoError(t, err)
@@ -103,6 +125,187 @@ hello worldhello worldhello worldhello worldhello worldhello worldhello worldhel
 		expOrigContent := `hello worldhello worldhello worldhello worldhello worldhello worldhello worldhello worldhello worldhello world
 hello worldhello worldhello worldhello worldhello worldhello worldhello worldhello world`
 		assert.Equal(t, expOrigContent, content.Content)
+	})
+
+	t.Run("test streamable line and bypass error", func(t *testing.T) {
+		stWithErr := mockStreamableToolWithError()
+		tCtx := &adk.ToolContext{
+			Name:   "mock_streamable_tool",
+			CallID: "54321",
+		}
+		backend := filesystem.NewInMemoryBackend()
+		config := &Config{
+			SkipTruncation: true,
+			ToolConfig: map[string]*ToolReductionConfig{
+				"mock_streamable_tool": {
+					Backend:        backend,
+					SkipTruncation: false,
+					TruncHandler:   defaultTruncHandler(testTruncOffloadPath("/tmp"), 70),
+				},
+			},
+		}
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+		edp, err := mw.WrapStreamableToolCall(ctx, stWithErr.StreamableRun, tCtx)
+		assert.NoError(t, err)
+		resp, err := edp(ctx, `{"value":"asd"}`)
+		assert.NoError(t, err)
+		cnt := 0
+		gotError := false
+		for {
+			_, err := resp.Recv()
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				assert.Equal(t, fmt.Errorf("mock error"), err)
+				gotError = true
+				break
+			}
+			cnt++
+		}
+		assert.True(t, gotError)
+		assert.Equal(t, 10, cnt)
+	})
+
+	t.Run("test TruncExcludeTools with invokable tool", func(t *testing.T) {
+		tCtx := &adk.ToolContext{
+			Name:   "important_tool",
+			CallID: "12345",
+		}
+		backend := filesystem.NewInMemoryBackend()
+		config := &Config{
+			Backend:           backend,
+			TruncExcludeTools: []string{"important_tool"},
+			MaxLengthForTrunc: 70,
+		}
+
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+
+		edp, err := mw.WrapInvokableToolCall(ctx, it.InvokableRun, tCtx)
+		assert.NoError(t, err)
+
+		resp, err := edp(ctx, `{"value":"asd"}`)
+		assert.NoError(t, err)
+
+		expOrigContent := `hello worldhello worldhello worldhello worldhello worldhello worldhello worldhello worldhello worldhello world
+hello worldhello worldhello worldhello worldhello worldhello worldhello worldhello world`
+		assert.Equal(t, expOrigContent, resp)
+
+		_, err = backend.Read(ctx, &filesystem.ReadRequest{FilePath: "/tmp/trunc/12345"})
+		assert.Error(t, err)
+	})
+
+	t.Run("test TruncExcludeTools with streamable tool", func(t *testing.T) {
+		tCtx := &adk.ToolContext{
+			Name:   "important_stream_tool",
+			CallID: "54321",
+		}
+		backend := filesystem.NewInMemoryBackend()
+		config := &Config{
+			Backend:           backend,
+			TruncExcludeTools: []string{"important_stream_tool"},
+			MaxLengthForTrunc: 70,
+		}
+
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+
+		edp, err := mw.WrapStreamableToolCall(ctx, st.StreamableRun, tCtx)
+		assert.NoError(t, err)
+
+		resp, err := edp(ctx, `{"value":"asd"}`)
+		assert.NoError(t, err)
+
+		var fullOutput strings.Builder
+		for {
+			chunk, recvErr := resp.Recv()
+			if recvErr != nil {
+				if recvErr == io.EOF {
+					break
+				}
+				assert.Fail(t, "unexpected error", recvErr)
+			}
+			fullOutput.WriteString(chunk)
+		}
+		resp.Close()
+
+		expOrigContent := `hello worldhello worldhello worldhello worldhello worldhello worldhello worldhello worldhello worldhello world
+hello worldhello worldhello worldhello worldhello worldhello worldhello worldhello world`
+		assert.Equal(t, expOrigContent, fullOutput.String())
+
+		_, err = backend.Read(ctx, &filesystem.ReadRequest{FilePath: "/tmp/trunc/54321"})
+		assert.Error(t, err)
+	})
+
+	t.Run("test mixed tools with TruncExcludeTools", func(t *testing.T) {
+		excludedToolCtx := &adk.ToolContext{
+			Name:   "excluded_tool",
+			CallID: "excluded_123",
+		}
+		normalToolCtx := &adk.ToolContext{
+			Name:   "normal_tool",
+			CallID: "normal_456",
+		}
+		backend := filesystem.NewInMemoryBackend()
+		config := &Config{
+			Backend:           backend,
+			TruncExcludeTools: []string{"excluded_tool"},
+			MaxLengthForTrunc: 70,
+		}
+
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+
+		excludedEdp, err := mw.WrapInvokableToolCall(ctx, it.InvokableRun, excludedToolCtx)
+		assert.NoError(t, err)
+		excludedResp, err := excludedEdp(ctx, `{"value":"asd"}`)
+		assert.NoError(t, err)
+		expOrigContent := `hello worldhello worldhello worldhello worldhello worldhello worldhello worldhello worldhello worldhello world
+hello worldhello worldhello worldhello worldhello worldhello worldhello worldhello world`
+		assert.Equal(t, expOrigContent, excludedResp)
+
+		normalEdp, err := mw.WrapInvokableToolCall(ctx, it.InvokableRun, normalToolCtx)
+		assert.NoError(t, err)
+		normalResp, err := normalEdp(ctx, `{"value":"asd"}`)
+		assert.NoError(t, err)
+		assert.NotEqual(t, expOrigContent, normalResp)
+		assert.Contains(t, normalResp, "persisted-output")
+
+		content, err := backend.Read(ctx, &filesystem.ReadRequest{FilePath: "/tmp/trunc/normal_456"})
+		assert.NoError(t, err)
+		assert.Equal(t, expOrigContent, content.Content)
+	})
+
+	t.Run("test GenTruncOffloadFilePath used by default trunc handler", func(t *testing.T) {
+		tCtx := &adk.ToolContext{
+			Name:   "mock_invokable_tool",
+			CallID: "custom_123",
+		}
+		backend := filesystem.NewInMemoryBackend()
+		config := &Config{
+			Backend:           backend,
+			MaxLengthForTrunc: 70,
+			RootDir:           "/tmp/ignored",
+			GenTruncOffloadFilePath: func(_ context.Context, detail *ToolDetail) (string, error) {
+				assert.Equal(t, "custom_123", detail.ToolContext.CallID)
+				return "/custom/trunc/custom_123", nil
+			},
+		}
+
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+
+		edp, err := mw.WrapInvokableToolCall(ctx, it.InvokableRun, tCtx)
+		assert.NoError(t, err)
+
+		resp, err := edp(ctx, `{"value":"asd"}`)
+		assert.NoError(t, err)
+		assert.Contains(t, resp, "/custom/trunc/custom_123")
+
+		_, err = backend.Read(ctx, &filesystem.ReadRequest{FilePath: "/custom/trunc/custom_123"})
+		assert.NoError(t, err)
 	})
 }
 
@@ -132,7 +335,7 @@ func TestReductionMiddlewareClear(t *testing.T) {
 				"get_weather": {
 					Backend:      backend,
 					SkipClear:    false,
-					ClearHandler: defaultClearHandler("/tmp", true, "read_file"),
+					ClearHandler: defaultClearHandler(testClearOffloadPath("/tmp"), true, "read_file"),
 				},
 			},
 		}
@@ -187,6 +390,49 @@ func TestReductionMiddlewareClear(t *testing.T) {
 		assert.Equal(t, "Sunny", fileContentStr)
 	})
 
+	t.Run("test GenClearOffloadFilePath used by default clear handler", func(t *testing.T) {
+		backend := filesystem.NewInMemoryBackend()
+		config := &Config{
+			Backend:                   backend,
+			SkipTruncation:            true,
+			TokenCounter:              func(context.Context, []adk.Message, []*schema.ToolInfo) (int64, error) { return 100, nil },
+			MaxTokensForClear:         20,
+			ClearRetentionSuffixLimit: 1,
+			RootDir:                   "/tmp/ignored",
+			GenClearOffloadFilePath: func(_ context.Context, detail *ToolDetail) (string, error) {
+				return "/custom/clear/" + detail.ToolContext.CallID, nil
+			},
+		}
+
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+
+		_, s, err := mw.BeforeModelRewriteState(ctx, &adk.ChatModelAgentState{
+			Messages: []adk.Message{
+				schema.SystemMessage("you are a helpful assistant"),
+				schema.UserMessage("trigger clear"),
+				schema.AssistantMessage("", []schema.ToolCall{
+					{ID: "call_a", Type: "function", Function: schema.FunctionCall{Name: "get_weather", Arguments: `{}`}},
+				}),
+				schema.ToolMessage("Sunny", "call_a"),
+				schema.AssistantMessage("", []schema.ToolCall{
+					{ID: "call_b", Type: "function", Function: schema.FunctionCall{Name: "get_weather", Arguments: `{}`}},
+				}),
+				schema.ToolMessage("Sunny", "call_b"),
+			},
+		}, &adk.ModelContext{Tools: toolsInfo})
+		assert.NoError(t, err)
+
+		assert.Equal(t, "<persisted-output>Tool result saved to: /custom/clear/call_a\nUse read_file to view</persisted-output>", s.Messages[3].Content)
+
+		fileContent, err := backend.Read(ctx, &filesystem.ReadRequest{
+			FilePath: "/custom/clear/call_a",
+		})
+		assert.NoError(t, err)
+		fileContentStr := strings.TrimPrefix(strings.TrimSpace(fileContent.Content), "1\t")
+		assert.Equal(t, "Sunny", fileContentStr)
+	})
+
 	t.Run("test default clear without offloading", func(t *testing.T) {
 		config := &Config{
 			SkipTruncation:            true,
@@ -196,7 +442,7 @@ func TestReductionMiddlewareClear(t *testing.T) {
 			ToolConfig: map[string]*ToolReductionConfig{
 				"get_weather": {
 					SkipClear:    false,
-					ClearHandler: defaultClearHandler("", false, ""),
+					ClearHandler: defaultClearHandler(testClearOffloadPath(""), false, ""),
 				},
 			},
 		}
@@ -358,7 +604,7 @@ func TestReductionMiddlewareClear(t *testing.T) {
 				"get_weather": {
 					Backend:      backend,
 					SkipClear:    false,
-					ClearHandler: defaultClearHandler("/tmp", true, "read_file"),
+					ClearHandler: defaultClearHandler(testClearOffloadPath("/tmp"), true, "read_file"),
 				},
 			},
 		}
@@ -394,7 +640,7 @@ func TestReductionMiddlewareClear(t *testing.T) {
 				Function: schema.FunctionCall{Name: "get_weather", Arguments: `{"location": "London, UK", "unit": "c"}`},
 			},
 		}, s.Messages[2].ToolCalls)
-		assert.NotNil(t, msgs[2].Extra[msgReducedFlag])
+		assert.NotNil(t, msgs[2].Extra[msgClearedFlag])
 		assert.Equal(t, []schema.ToolCall{
 			{
 				ID:       "call_123456789",
@@ -429,7 +675,7 @@ func TestReductionMiddlewareClear(t *testing.T) {
 				Function: schema.FunctionCall{Name: "get_weather", Arguments: `{"location": "London, UK", "unit": "c"}`},
 			},
 		}, s.Messages[2].ToolCalls)
-		assert.NotNil(t, msgs[2].Extra[msgReducedFlag])
+		assert.NotNil(t, msgs[2].Extra[msgClearedFlag])
 		assert.Equal(t, []schema.ToolCall{
 			{
 				ID:       "call_123456789",
@@ -437,9 +683,436 @@ func TestReductionMiddlewareClear(t *testing.T) {
 				Function: schema.FunctionCall{Name: "get_weather", Arguments: `{"location": "London, UK", "unit": "c"}`},
 			},
 		}, s.Messages[4].ToolCalls)
-		assert.NotNil(t, msgs[4].Extra[msgReducedFlag])
+		assert.NotNil(t, msgs[4].Extra[msgClearedFlag])
 		assert.Equal(t, "<persisted-output>Tool result saved to: /tmp/clear/call_987654321\nUse read_file to view</persisted-output>", s.Messages[3].Content)
 		assert.Equal(t, "<persisted-output>Tool result saved to: /tmp/clear/call_123456789\nUse read_file to view</persisted-output>", s.Messages[5].Content)
+	})
+
+	t.Run("test ClearExcludeTools", func(t *testing.T) {
+		backend := filesystem.NewInMemoryBackend()
+		config := &Config{
+			SkipTruncation:            true,
+			TokenCounter:              defaultTokenCounter,
+			MaxTokensForClear:         20,
+			ClearRetentionSuffixLimit: 0,
+			ClearExcludeTools:         []string{"get_important_data"},
+			ToolConfig: map[string]*ToolReductionConfig{
+				"get_weather": {
+					Backend:      backend,
+					SkipClear:    false,
+					ClearHandler: defaultClearHandler(testClearOffloadPath("/tmp"), true, "read_file"),
+				},
+				"get_important_data": {
+					Backend:      backend,
+					SkipClear:    false,
+					ClearHandler: defaultClearHandler(testClearOffloadPath("/tmp"), true, "read_file"),
+				},
+			},
+		}
+
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+		msgs := []adk.Message{
+			schema.SystemMessage("you are a helpful assistant"),
+			schema.UserMessage("If it's warmer than 20°C in London, set the thermostat to 20°C, otherwise set it to 18°C."),
+			schema.AssistantMessage("", []schema.ToolCall{
+				{
+					ID:       "call_987654321",
+					Type:     "function",
+					Function: schema.FunctionCall{Name: "get_weather", Arguments: `{"location": "London, UK", "unit": "c"}`},
+				},
+			}),
+			schema.ToolMessage("Sunny", "call_987654321"),
+			schema.AssistantMessage("", []schema.ToolCall{
+				{
+					ID:       "call_123456789",
+					Type:     "function",
+					Function: schema.FunctionCall{Name: "get_important_data", Arguments: `{"id": "123"}`},
+				},
+			}),
+			schema.ToolMessage("Important Data Content", "call_123456789"),
+			schema.AssistantMessage("", []schema.ToolCall{
+				{
+					ID:       "call_999",
+					Type:     "function",
+					Function: schema.FunctionCall{Name: "get_weather", Arguments: `{"location": "London, UK", "unit": "c"}`},
+				},
+			}),
+			schema.ToolMessage("Sunny", "call_999"),
+		}
+		_, s, err := mw.BeforeModelRewriteState(ctx, &adk.ChatModelAgentState{Messages: msgs}, &adk.ModelContext{Tools: toolsInfo})
+		assert.NoError(t, err)
+		assert.Equal(t, "<persisted-output>Tool result saved to: /tmp/clear/call_987654321\nUse read_file to view</persisted-output>", s.Messages[3].Content)
+		assert.Equal(t, "Important Data Content", s.Messages[5].Content)
+		b, err := backend.Read(ctx, &filesystem.ReadRequest{
+			FilePath: "/tmp/clear/call_987654321",
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, "Sunny", b.Content)
+		_, err = backend.Read(ctx, &filesystem.ReadRequest{
+			FilePath: "/tmp/clear/call_123456789",
+		})
+		assert.Error(t, err)
+		assert.Equal(t, "file not found: /tmp/clear/call_123456789", err.Error())
+	})
+
+	t.Run("test ClearAtLeastTokens - not enough tokens cleared", func(t *testing.T) {
+		backend := filesystem.NewInMemoryBackend()
+		config := &Config{
+			SkipTruncation: true,
+			TokenCounter: func(_ context.Context, msgs []adk.Message, _ []*schema.ToolInfo) (int64, error) {
+				var size int
+				for _, msg := range msgs {
+					size += len(msg.Content)
+					for _, tc := range msg.ToolCalls {
+						size += len(tc.Function.Name)
+						size += len(tc.Function.Arguments)
+					}
+				}
+				return int64(size), nil
+			},
+			MaxTokensForClear:         50,
+			ClearRetentionSuffixLimit: 1,
+			ClearAtLeastTokens:        100,
+			ToolConfig: map[string]*ToolReductionConfig{
+				"get_weather": {
+					Backend:      backend,
+					SkipClear:    false,
+					ClearHandler: defaultClearHandler(testClearOffloadPath("/tmp"), true, "read_file"),
+				},
+				"get_important_data": {
+					Backend:      backend,
+					SkipClear:    false,
+					ClearHandler: defaultClearHandler(testClearOffloadPath("/tmp"), true, "read_file"),
+				},
+			},
+		}
+
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+		msgs := []adk.Message{
+			schema.SystemMessage("you are a helpful assistant"),
+			schema.UserMessage("If it's warmer than 20°C in London, set the thermostat to 20°C, otherwise set it to 18°C."),
+			schema.AssistantMessage("", []schema.ToolCall{
+				{
+					ID:       "call_987654321",
+					Type:     "function",
+					Function: schema.FunctionCall{Name: "get_weather", Arguments: `{"location": "London, UK", "unit": "c"}`},
+				},
+			}),
+			schema.ToolMessage("Sunny Sunny Sunny Sunny Sunny Sunny Sunny Sunny Sunny Sunny Sunny Sunny Sunny", "call_123456789"),
+			schema.AssistantMessage("", []schema.ToolCall{
+				{
+					ID:       "call_123456789",
+					Type:     "function",
+					Function: schema.FunctionCall{Name: "get_important_data", Arguments: `{"id": "123"}`},
+				},
+			}),
+			schema.ToolMessage("Important Data Content, qweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqwe", "call_123456789"),
+			schema.AssistantMessage("", []schema.ToolCall{
+				{
+					ID:       "call_999",
+					Type:     "function",
+					Function: schema.FunctionCall{Name: "get_weather", Arguments: `{"location": "London, UK", "unit": "c"}`},
+				},
+			}),
+			schema.ToolMessage("Sunny", "call_999"),
+		}
+		_, s, err := mw.BeforeModelRewriteState(ctx, &adk.ChatModelAgentState{Messages: msgs}, &adk.ModelContext{Tools: toolsInfo})
+		assert.NoError(t, err)
+		assert.Equal(t, "Sunny Sunny Sunny Sunny Sunny Sunny Sunny Sunny Sunny Sunny Sunny Sunny Sunny", s.Messages[3].Content)
+		assert.Equal(t, "Important Data Content, qweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqwe", s.Messages[5].Content)
+		_, err = backend.Read(ctx, &filesystem.ReadRequest{
+			FilePath: "/tmp/clear/call_987654321",
+		})
+		assert.Error(t, err)
+	})
+
+	t.Run("test ClearAtLeastTokens - enough tokens cleared", func(t *testing.T) {
+		backend := filesystem.NewInMemoryBackend()
+		config := &Config{
+			SkipTruncation: true,
+			TokenCounter: func(_ context.Context, msgs []adk.Message, _ []*schema.ToolInfo) (int64, error) {
+				var size int
+				for _, msg := range msgs {
+					size += len(msg.Content)
+					for _, tc := range msg.ToolCalls {
+						size += len(tc.Function.Name)
+						size += len(tc.Function.Arguments)
+					}
+				}
+				return int64(size), nil
+			},
+			MaxTokensForClear:         50,
+			ClearRetentionSuffixLimit: 1,
+			ClearAtLeastTokens:        10,
+			ToolConfig: map[string]*ToolReductionConfig{
+				"get_weather": {
+					Backend:      backend,
+					SkipClear:    false,
+					ClearHandler: defaultClearHandler(testClearOffloadPath("/tmp"), true, "read_file"),
+				},
+				"get_important_data": {
+					Backend:      backend,
+					SkipClear:    false,
+					ClearHandler: defaultClearHandler(testClearOffloadPath("/tmp"), true, "read_file"),
+				},
+			},
+		}
+
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+		msgs := []adk.Message{
+			schema.SystemMessage("you are a helpful assistant"),
+			schema.UserMessage("If it's warmer than 20°C in London, set the thermostat to 20°C, otherwise set it to 18°C."),
+			schema.AssistantMessage("", []schema.ToolCall{
+				{
+					ID:       "call_987654321",
+					Type:     "function",
+					Function: schema.FunctionCall{Name: "get_weather", Arguments: `{"location": "London, UK", "unit": "c"}`},
+				},
+			}),
+			schema.ToolMessage("Sunny Sunny Sunny Sunny Sunny Sunny Sunny Sunny Sunny Sunny Sunny Sunny Sunny", "call_123456789"),
+			schema.AssistantMessage("", []schema.ToolCall{
+				{
+					ID:       "call_123456789",
+					Type:     "function",
+					Function: schema.FunctionCall{Name: "get_important_data", Arguments: `{"id": "123"}`},
+				},
+			}),
+			schema.ToolMessage("Important Data Content, qweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqweqwe", "call_123456789"),
+			schema.AssistantMessage("", []schema.ToolCall{
+				{
+					ID:       "call_999",
+					Type:     "function",
+					Function: schema.FunctionCall{Name: "get_weather", Arguments: `{"location": "London, UK", "unit": "c"}`},
+				},
+			}),
+			schema.ToolMessage("Sunny", "call_999"),
+		}
+		_, s, err := mw.BeforeModelRewriteState(ctx, &adk.ChatModelAgentState{Messages: msgs}, &adk.ModelContext{Tools: toolsInfo})
+		assert.NoError(t, err)
+		assert.Equal(t, "<persisted-output>Tool result saved to: /tmp/clear/call_987654321\nUse read_file to view</persisted-output>", s.Messages[3].Content)
+		_, err = backend.Read(ctx, &filesystem.ReadRequest{
+			FilePath: "/tmp/clear/call_987654321",
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, "<persisted-output>Tool result saved to: /tmp/clear/call_123456789\nUse read_file to view</persisted-output>", s.Messages[5].Content)
+		_, err = backend.Read(ctx, &filesystem.ReadRequest{
+			FilePath: "/tmp/clear/call_987654321",
+		})
+		assert.NoError(t, err)
+	})
+}
+
+func TestGetJointToolResult(t *testing.T) {
+	t.Run("test with ToolResult", func(t *testing.T) {
+		detail := &ToolDetail{
+			ToolResult: &schema.ToolResult{Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: "hello world"}}},
+		}
+		toolOutputParts, needProcess, err := getJointToolResult(detail)
+		assert.NoError(t, err)
+		assert.True(t, needProcess)
+		assert.Len(t, toolOutputParts, 1)
+		assert.Equal(t, schema.ToolPartTypeText, toolOutputParts[0].Type)
+		assert.Equal(t, "hello world", toolOutputParts[0].Text)
+	})
+
+	t.Run("test with multiple ToolResult parts", func(t *testing.T) {
+		detail := &ToolDetail{
+			ToolResult: &schema.ToolResult{Parts: []schema.ToolOutputPart{
+				{Type: schema.ToolPartTypeText, Text: "hello "},
+				{Type: schema.ToolPartTypeText, Text: "world"},
+			}},
+		}
+		toolOutputParts, needProcess, err := getJointToolResult(detail)
+		assert.NoError(t, err)
+		assert.True(t, needProcess)
+		assert.Len(t, toolOutputParts, 2)
+		assert.Equal(t, schema.ToolPartTypeText, toolOutputParts[0].Type)
+		assert.Equal(t, "hello ", toolOutputParts[0].Text)
+		assert.Equal(t, schema.ToolPartTypeText, toolOutputParts[1].Type)
+		assert.Equal(t, "world", toolOutputParts[1].Text)
+	})
+
+	t.Run("test with empty ToolResult parts", func(t *testing.T) {
+		detail := &ToolDetail{
+			ToolResult: &schema.ToolResult{Parts: []schema.ToolOutputPart{}},
+		}
+		toolOutputParts, needProcess, err := getJointToolResult(detail)
+		assert.NoError(t, err)
+		assert.False(t, needProcess)
+		assert.Nil(t, toolOutputParts)
+	})
+
+	t.Run("test with ToolResult multimodal", func(t *testing.T) {
+		detail := &ToolDetail{
+			ToolResult: &schema.ToolResult{Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeImage, Text: "https://example.com/image.png"}}},
+		}
+		toolOutputParts, needProcess, err := getJointToolResult(detail)
+		assert.NoError(t, err)
+		assert.True(t, needProcess)
+		assert.Len(t, toolOutputParts, 1)
+		assert.Equal(t, schema.ToolPartTypeImage, toolOutputParts[0].Type)
+		assert.Equal(t, "https://example.com/image.png", toolOutputParts[0].Text)
+	})
+
+	t.Run("test with StreamToolResult", func(t *testing.T) {
+		sr, sw := schema.Pipe[*schema.ToolResult](10)
+		go func() {
+			sw.Send(&schema.ToolResult{Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: "hello "}}}, nil)
+			sw.Send(&schema.ToolResult{Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: "world"}}}, nil)
+			sw.Close()
+		}()
+
+		detail := &ToolDetail{
+			StreamToolResult: sr,
+		}
+		toolOutputParts, needProcess, err := getJointToolResult(detail)
+		assert.NoError(t, err)
+		assert.True(t, needProcess)
+		assert.Len(t, toolOutputParts, 1)
+		assert.Equal(t, schema.ToolPartTypeText, toolOutputParts[0].Type)
+		assert.Equal(t, "hello world", toolOutputParts[0].Text)
+	})
+
+	t.Run("test with StreamToolResult error", func(t *testing.T) {
+		sr, sw := schema.Pipe[*schema.ToolResult](10)
+		go func() {
+			sw.Send(nil, fmt.Errorf("stream error"))
+			sw.Close()
+		}()
+
+		detail := &ToolDetail{
+			StreamToolResult: sr,
+		}
+		toolOutputParts, needProcess, err := getJointToolResult(detail)
+		assert.NoError(t, err)
+		assert.False(t, needProcess)
+		assert.Nil(t, toolOutputParts)
+	})
+
+	t.Run("test with both ToolResult and StreamToolResult nil (should error)", func(t *testing.T) {
+		detail := &ToolDetail{}
+		toolOutputParts, needProcess, err := getJointToolResult(detail)
+		assert.Error(t, err)
+		assert.False(t, needProcess)
+		assert.Nil(t, toolOutputParts)
+	})
+}
+
+func TestDefaultTruncHandlerWithStreamToolResult(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("test short stream result no trunc", func(t *testing.T) {
+		sr, sw := schema.Pipe[*schema.ToolResult](10)
+		go func() {
+			sw.Send(&schema.ToolResult{Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: "short text"}}}, nil)
+			sw.Close()
+		}()
+
+		detail := &ToolDetail{
+			ToolContext: &adk.ToolContext{
+				Name:   "test",
+				CallID: "call_id",
+			},
+			ToolArgument:     &schema.ToolArgument{Text: "{}"},
+			StreamToolResult: sr,
+		}
+
+		fn := defaultTruncHandler(testTruncOffloadPath("/tmp"), 100)
+		result, err := fn(ctx, detail)
+		assert.NoError(t, err)
+		assert.False(t, result.NeedTrunc)
+	})
+
+	t.Run("test long stream result need trunc", func(t *testing.T) {
+		sr, sw := schema.Pipe[*schema.ToolResult](10)
+		go func() {
+			sw.Send(&schema.ToolResult{Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: strings.Repeat("hello world", 20)}}}, nil)
+			sw.Close()
+		}()
+
+		detail := &ToolDetail{
+			ToolContext: &adk.ToolContext{
+				Name:   "test",
+				CallID: "call_id",
+			},
+			ToolArgument:     &schema.ToolArgument{Text: "{}"},
+			StreamToolResult: sr,
+		}
+
+		fn := defaultTruncHandler(testTruncOffloadPath("/tmp"), 100)
+		result, err := fn(ctx, detail)
+		assert.NoError(t, err)
+		assert.True(t, result.NeedTrunc)
+	})
+
+	t.Run("test gen offload file path error", func(t *testing.T) {
+		detail := &ToolDetail{
+			ToolContext: &adk.ToolContext{
+				Name:   "test",
+				CallID: "call_id",
+			},
+			ToolArgument: &schema.ToolArgument{Text: "{}"},
+			ToolResult: &schema.ToolResult{
+				Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: strings.Repeat("x", 1000)}},
+			},
+		}
+
+		fn := defaultTruncHandler(func(context.Context, *ToolDetail) (string, error) {
+			return "", fmt.Errorf("gen path error")
+		}, 10)
+		_, err := fn(ctx, detail)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "gen path error")
+	})
+}
+
+func TestDefaultClearHandlerWithStreamToolResult(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("test with stream result need offload", func(t *testing.T) {
+		sr, sw := schema.Pipe[*schema.ToolResult](10)
+		go func() {
+			sw.Send(&schema.ToolResult{Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: "streaming content"}}}, nil)
+			sw.Close()
+		}()
+
+		detail := &ToolDetail{
+			ToolContext: &adk.ToolContext{
+				Name:   "test",
+				CallID: "stream_call_id",
+			},
+			ToolArgument:     &schema.ToolArgument{Text: "{}"},
+			StreamToolResult: sr,
+		}
+
+		fn := defaultClearHandler(testClearOffloadPath("/tmp"), true, "read_file")
+		result, err := fn(ctx, detail)
+		assert.NoError(t, err)
+		assert.True(t, result.NeedClear)
+		assert.True(t, result.NeedOffload)
+		assert.Equal(t, "streaming content", result.OffloadContent)
+	})
+
+	t.Run("test gen offload file path error", func(t *testing.T) {
+		detail := &ToolDetail{
+			ToolContext: &adk.ToolContext{
+				Name:   "test",
+				CallID: "call_id",
+			},
+			ToolArgument: &schema.ToolArgument{Text: "{}"},
+			ToolResult: &schema.ToolResult{
+				Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: "content"}},
+			},
+		}
+		fn := defaultClearHandler(func(context.Context, *ToolDetail) (string, error) {
+			return "", fmt.Errorf("gen path error")
+		}, true, "read_file")
+		_, err := fn(ctx, detail)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "gen path error")
 	})
 }
 
@@ -454,7 +1127,7 @@ func TestDefaultOffloadHandler(t *testing.T) {
 		ToolResult:   &schema.ToolResult{Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: "hello"}}},
 	}
 
-	fn := defaultClearHandler("/tmp", true, "read_file")
+	fn := defaultClearHandler(testClearOffloadPath("/tmp"), true, "read_file")
 	info, err := fn(ctx, detail)
 	assert.NoError(t, err)
 	assert.Equal(t, &ClearResult{
@@ -498,6 +1171,25 @@ func mockStreamableTool() tool.StreamableTool {
 		for _, part := range splitStrings(s3, 10) {
 			sw.Send(part, nil)
 		}
+		sw.Close()
+		return sr, nil
+	})
+	return t
+}
+
+func mockStreamableToolWithError() tool.StreamableTool {
+	type ContentContainer struct {
+		Value string `json:"value"`
+	}
+	s1 := strings.Repeat("hello world", 10) + "\n"
+	s2 := strings.Repeat("hello world", 8)
+	s3 := s1 + s2
+	t, _ := utils.InferStreamTool("mock_streamable_tool", "test desc", func(ctx context.Context, input ContentContainer) (output *schema.StreamReader[string], err error) {
+		sr, sw := schema.Pipe[string](11)
+		for _, part := range splitStrings(s3, 10) {
+			sw.Send(part, nil)
+		}
+		sw.Send("", fmt.Errorf("mock error"))
 		sw.Close()
 		return sr, nil
 	})
@@ -644,61 +1336,26 @@ func TestConvMessageInputPartToToolOutputPart(t *testing.T) {
 func TestGetSetMsgOffloadedFlag(t *testing.T) {
 	t.Run("test get offloaded flag - not set", func(t *testing.T) {
 		msg := schema.UserMessage("test")
-		assert.False(t, getMsgOffloadedFlag(msg))
+		assert.False(t, getMsgClearedFlag(msg))
 	})
 
 	t.Run("test get offloaded flag - set", func(t *testing.T) {
 		msg := schema.UserMessage("test")
-		setMsgOffloadedFlag(msg)
-		assert.True(t, getMsgOffloadedFlag(msg))
+		setMsgClearedFlag(msg)
+		assert.True(t, getMsgClearedFlag(msg))
 	})
 
 	t.Run("test set offloaded flag - nil extra", func(t *testing.T) {
 		msg := schema.UserMessage("test")
-		setMsgOffloadedFlag(msg)
-		assert.True(t, getMsgOffloadedFlag(msg))
+		setMsgClearedFlag(msg)
+		assert.True(t, getMsgClearedFlag(msg))
 	})
 
 	t.Run("test set offloaded flag - existing extra", func(t *testing.T) {
 		msg := schema.UserMessage("test")
 		msg.Extra = map[string]any{"existing": "value"}
-		setMsgOffloadedFlag(msg)
-		assert.True(t, getMsgOffloadedFlag(msg))
-		assert.Equal(t, "value", msg.Extra["existing"])
-	})
-}
-
-func TestGetSetMsgCachedToken(t *testing.T) {
-	t.Run("test get cached token - not set", func(t *testing.T) {
-		msg := schema.UserMessage("test")
-		tokens, ok := getMsgCachedToken(msg)
-		assert.False(t, ok)
-		assert.Equal(t, int64(0), tokens)
-	})
-
-	t.Run("test get cached token - set", func(t *testing.T) {
-		msg := schema.UserMessage("test")
-		setMsgCachedToken(msg, 100)
-		tokens, ok := getMsgCachedToken(msg)
-		assert.True(t, ok)
-		assert.Equal(t, int64(100), tokens)
-	})
-
-	t.Run("test set cached token - nil extra", func(t *testing.T) {
-		msg := schema.UserMessage("test")
-		setMsgCachedToken(msg, 200)
-		tokens, ok := getMsgCachedToken(msg)
-		assert.True(t, ok)
-		assert.Equal(t, int64(200), tokens)
-	})
-
-	t.Run("test set cached token - existing extra", func(t *testing.T) {
-		msg := schema.UserMessage("test")
-		msg.Extra = map[string]any{"existing": "value"}
-		setMsgCachedToken(msg, 300)
-		tokens, ok := getMsgCachedToken(msg)
-		assert.True(t, ok)
-		assert.Equal(t, int64(300), tokens)
+		setMsgClearedFlag(msg)
+		assert.True(t, getMsgClearedFlag(msg))
 		assert.Equal(t, "value", msg.Extra["existing"])
 	})
 }
@@ -735,7 +1392,7 @@ func TestGetToolConfig(t *testing.T) {
 		}
 		mw, err := New(ctx, config)
 		assert.NoError(t, err)
-		trmw, ok := mw.(*toolReductionMiddleware)
+		trmw, ok := mw.(*typedToolReductionMiddleware[*schema.Message])
 		assert.True(t, ok)
 
 		cfg := trmw.getToolConfig("non_existent_tool", sceneTruncation)
@@ -756,7 +1413,7 @@ func TestGetToolConfig(t *testing.T) {
 		}
 		mw, err := New(ctx, config)
 		assert.NoError(t, err)
-		trmw, ok := mw.(*toolReductionMiddleware)
+		trmw, ok := mw.(*typedToolReductionMiddleware[*schema.Message])
 		assert.True(t, ok)
 
 		cfg := trmw.getToolConfig("test_tool", sceneTruncation)
@@ -776,7 +1433,7 @@ func TestGetToolConfig(t *testing.T) {
 		}
 		mw, err := New(ctx, config)
 		assert.NoError(t, err)
-		trmw, ok := mw.(*toolReductionMiddleware)
+		trmw, ok := mw.(*typedToolReductionMiddleware[*schema.Message])
 		assert.True(t, ok)
 
 		cfg := trmw.getToolConfig("test_tool", sceneTruncation)
@@ -796,6 +1453,40 @@ func TestCopyAndFillDefaults(t *testing.T) {
 		assert.Equal(t, 50000, result.MaxLengthForTrunc)
 		assert.Equal(t, 1, result.ClearRetentionSuffixLimit)
 		assert.NotNil(t, result.TokenCounter)
+		assert.NotNil(t, result.GenTruncOffloadFilePath)
+		assert.NotNil(t, result.GenClearOffloadFilePath)
+
+		truncPath, err := result.GenTruncOffloadFilePath(context.Background(), &ToolDetail{
+			ToolContext: &adk.ToolContext{CallID: "call_1"},
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, "/tmp/trunc/call_1", truncPath)
+
+		clearPath, err := result.GenClearOffloadFilePath(context.Background(), &ToolDetail{
+			ToolContext: &adk.ToolContext{CallID: "call_1"},
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, "/tmp/clear/call_1", clearPath)
+	})
+
+	t.Run("test default offload path generators create uuid when CallID is empty", func(t *testing.T) {
+		cfg := &Config{}
+		result, err := cfg.copyAndFillDefaults()
+		assert.NoError(t, err)
+
+		truncPath, err := result.GenTruncOffloadFilePath(context.Background(), &ToolDetail{
+			ToolContext: &adk.ToolContext{CallID: ""},
+		})
+		assert.NoError(t, err)
+		assert.True(t, strings.HasPrefix(truncPath, "/tmp/trunc/"))
+		assert.NotEqual(t, "/tmp/trunc/", truncPath)
+
+		clearPath, err := result.GenClearOffloadFilePath(context.Background(), &ToolDetail{
+			ToolContext: &adk.ToolContext{CallID: ""},
+		})
+		assert.NoError(t, err)
+		assert.True(t, strings.HasPrefix(clearPath, "/tmp/clear/"))
+		assert.NotEqual(t, "/tmp/clear/", clearPath)
 	})
 
 	t.Run("test with tool config", func(t *testing.T) {
@@ -810,6 +1501,26 @@ func TestCopyAndFillDefaults(t *testing.T) {
 		assert.NoError(t, err)
 		assert.NotNil(t, result.ToolConfig)
 		assert.True(t, result.ToolConfig["test_tool"].SkipTruncation)
+	})
+
+	t.Run("test custom offload path generators preserved", func(t *testing.T) {
+		cfg := &Config{
+			RootDir: "/tmp/ignored",
+			GenTruncOffloadFilePath: func(_ context.Context, detail *ToolDetail) (string, error) {
+				return "/custom/trunc/" + detail.ToolContext.CallID, nil
+			},
+			GenClearOffloadFilePath: func(_ context.Context, detail *ToolDetail) (string, error) {
+				return "/custom/clear/" + detail.ToolContext.CallID, nil
+			},
+		}
+		result, err := cfg.copyAndFillDefaults()
+		assert.NoError(t, err)
+
+		filePath, err := result.GenClearOffloadFilePath(context.Background(), &ToolDetail{
+			ToolContext: &adk.ToolContext{CallID: "call_custom"},
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, "/custom/clear/call_custom", filePath)
 	})
 }
 
@@ -838,7 +1549,7 @@ func TestDefaultClearHandler(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("test empty parts", func(t *testing.T) {
-		handler := defaultClearHandler("/tmp", true, "read_file")
+		handler := defaultClearHandler(testClearOffloadPath("/tmp"), true, "read_file")
 		detail := &ToolDetail{
 			ToolContext: &adk.ToolContext{
 				CallID: "test_call",
@@ -851,7 +1562,7 @@ func TestDefaultClearHandler(t *testing.T) {
 	})
 
 	t.Run("test multimodal content", func(t *testing.T) {
-		handler := defaultClearHandler("/tmp", true, "read_file")
+		handler := defaultClearHandler(testClearOffloadPath("/tmp"), true, "read_file")
 		detail := &ToolDetail{
 			ToolContext: &adk.ToolContext{
 				CallID: "test_call",
@@ -860,13 +1571,13 @@ func TestDefaultClearHandler(t *testing.T) {
 				Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeImage}},
 			},
 		}
-		_, err := handler(ctx, detail)
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "not support multimodal")
+		result, err := handler(ctx, detail)
+		assert.NoError(t, err)
+		assert.Equal(t, detail.ToolResult, result.ToolResult)
 	})
 
 	t.Run("test no call id", func(t *testing.T) {
-		handler := defaultClearHandler("/tmp", true, "read_file")
+		handler := defaultClearHandler(testClearOffloadPath("/tmp"), true, "read_file")
 		detail := &ToolDetail{
 			ToolContext: &adk.ToolContext{},
 			ToolResult: &schema.ToolResult{
@@ -876,6 +1587,1177 @@ func TestDefaultClearHandler(t *testing.T) {
 		result, err := handler(ctx, detail)
 		assert.NoError(t, err)
 		assert.True(t, result.NeedClear)
-		assert.NotEmpty(t, result.OffloadFilePath)
+		assert.Equal(t, "/tmp/clear/generated", result.OffloadFilePath)
 	})
+}
+
+func TestStringifyToolOutputParts(t *testing.T) {
+	t.Run("test empty parts", func(t *testing.T) {
+		result := stringifyToolOutputParts([]schema.ToolOutputPart{})
+		assert.Equal(t, "", result)
+	})
+
+	t.Run("test single text part", func(t *testing.T) {
+		result := stringifyToolOutputParts([]schema.ToolOutputPart{
+			{Type: schema.ToolPartTypeText, Text: "hello world"},
+		})
+		assert.Equal(t, "hello world", result)
+	})
+
+	t.Run("test multiple text parts", func(t *testing.T) {
+		result := stringifyToolOutputParts([]schema.ToolOutputPart{
+			{Type: schema.ToolPartTypeText, Text: "hello "},
+			{Type: schema.ToolPartTypeText, Text: "world"},
+		})
+		expected := `[
+	{
+		"type": "text",
+		"text": "hello "
+	},
+	{
+		"type": "text",
+		"text": "world"
+	}
+]`
+		assert.JSONEq(t, expected, result)
+	})
+
+	t.Run("test with image part", func(t *testing.T) {
+		result := stringifyToolOutputParts([]schema.ToolOutputPart{
+			{Type: schema.ToolPartTypeImage, Text: "https://example.com/image.png"},
+		})
+		expected := `[
+	{
+		"type": "image",
+		"text": "https://example.com/image.png"
+	}
+]`
+		assert.JSONEq(t, expected, result)
+	})
+
+	t.Run("test mixed parts", func(t *testing.T) {
+		result := stringifyToolOutputParts([]schema.ToolOutputPart{
+			{Type: schema.ToolPartTypeText, Text: "hello world"},
+			{Type: schema.ToolPartTypeImage, Text: "https://example.com/image.png"},
+		})
+		expected := `[
+	{
+		"type": "text",
+		"text": "hello world"
+	},
+	{
+		"type": "image",
+		"text": "https://example.com/image.png"
+	}
+]`
+		assert.JSONEq(t, expected, result)
+	})
+}
+
+func TestClampPrefixToUTF8Boundary(t *testing.T) {
+	t.Run("test n <= 0", func(t *testing.T) {
+		result := clampPrefixToUTF8Boundary("hello world", 0)
+		assert.Equal(t, "", result)
+
+		result = clampPrefixToUTF8Boundary("hello world", -5)
+		assert.Equal(t, "", result)
+	})
+
+	t.Run("test n >= len(s)", func(t *testing.T) {
+		result := clampPrefixToUTF8Boundary("hello", 10)
+		assert.Equal(t, "hello", result)
+	})
+
+	t.Run("test ASCII string at rune boundary", func(t *testing.T) {
+		result := clampPrefixToUTF8Boundary("hello world", 5)
+		assert.Equal(t, "hello", result)
+	})
+
+	t.Run("test ASCII string not at rune boundary (should not happen)", func(t *testing.T) {
+		result := clampPrefixToUTF8Boundary("world", 3)
+		assert.Equal(t, "wor", result)
+	})
+
+	t.Run("test multi-byte UTF-8 characters at boundary", func(t *testing.T) {
+		s := "你好世界"
+		result := clampPrefixToUTF8Boundary(s, 3)
+		assert.Equal(t, "你", result)
+	})
+
+	t.Run("test multi-byte UTF-8 characters not at boundary", func(t *testing.T) {
+		s := "你好世界"
+		result := clampPrefixToUTF8Boundary(s, 2)
+		assert.Equal(t, "", result)
+
+		result = clampPrefixToUTF8Boundary(s, 4)
+		assert.Equal(t, "你", result)
+	})
+
+	t.Run("test mixed ASCII and multi-byte characters", func(t *testing.T) {
+		s := "hello你好world"
+		result := clampPrefixToUTF8Boundary(s, 5+3)
+		assert.Equal(t, "hello你", result)
+
+		result = clampPrefixToUTF8Boundary(s, 5+4)
+		assert.Equal(t, "hello你", result)
+
+		result = clampPrefixToUTF8Boundary(s, 5+6)
+		assert.Equal(t, "hello你好", result)
+	})
+}
+
+func TestClampSuffixToUTF8Boundary(t *testing.T) {
+	t.Run("test n <= 0", func(t *testing.T) {
+		result := clampSuffixToUTF8Boundary("hello world", 0)
+		assert.Equal(t, "", result)
+
+		result = clampSuffixToUTF8Boundary("hello world", -5)
+		assert.Equal(t, "", result)
+	})
+
+	t.Run("test n >= len(s)", func(t *testing.T) {
+		result := clampSuffixToUTF8Boundary("hello", 10)
+		assert.Equal(t, "hello", result)
+	})
+
+	t.Run("test ASCII string at rune boundary", func(t *testing.T) {
+		result := clampSuffixToUTF8Boundary("hello world", 5)
+		assert.Equal(t, "world", result)
+	})
+
+	t.Run("test ASCII string not at rune boundary (should not happen)", func(t *testing.T) {
+		result := clampSuffixToUTF8Boundary("hello", 3)
+		assert.Equal(t, "llo", result)
+	})
+
+	t.Run("test multi-byte UTF-8 characters at boundary", func(t *testing.T) {
+		s := "你好世界"
+		assert.Equal(t, 12, len(s))
+		result := clampSuffixToUTF8Boundary(s, 3)
+		assert.Equal(t, "界", result)
+	})
+
+	t.Run("test multi-byte UTF-8 characters not at boundary", func(t *testing.T) {
+		s := "你好世界"
+		result := clampSuffixToUTF8Boundary(s, 2)
+		assert.Equal(t, "", result)
+
+		result = clampSuffixToUTF8Boundary(s, 4)
+		assert.Equal(t, "界", result)
+
+		result = clampSuffixToUTF8Boundary(s, 6)
+		assert.Equal(t, "世界", result)
+	})
+
+	t.Run("test mixed ASCII and multi-byte characters", func(t *testing.T) {
+		s := "hello你好world"
+		result := clampSuffixToUTF8Boundary(s, 5+3)
+		assert.Equal(t, "好world", result)
+
+		result = clampSuffixToUTF8Boundary(s, 5+4)
+		assert.Equal(t, "好world", result)
+
+		result = clampSuffixToUTF8Boundary(s, 5+6)
+		assert.Equal(t, "你好world", result)
+	})
+}
+
+func TestGetMsgClearedFlag(t *testing.T) {
+	t.Run("test non-bool value in extra", func(t *testing.T) {
+		msg := schema.UserMessage("test")
+		msg.Extra = map[string]any{msgClearedFlag: "not a bool"}
+		flag := getMsgClearedFlag(msg)
+		assert.False(t, flag)
+	})
+}
+
+func TestCopyMessages(t *testing.T) {
+	t.Run("test empty messages", func(t *testing.T) {
+		result := copyMessages(nil)
+		assert.Len(t, result, 0)
+
+		result = copyMessages([]*schema.Message{})
+		assert.Len(t, result, 0)
+	})
+
+	t.Run("test message with tool calls and extra", func(t *testing.T) {
+		msg := schema.AssistantMessage("", []schema.ToolCall{
+			{
+				ID:       "call_123",
+				Type:     "function",
+				Function: schema.FunctionCall{Name: "test_func", Arguments: `{"key": "value"}`},
+			},
+		})
+		msg.Extra = map[string]any{"test_key": "test_value"}
+		msg.UserInputMultiContent = []schema.MessageInputPart{
+			{Type: schema.ChatMessagePartTypeText, Text: "test text"},
+		}
+		msg.MultiContent = []schema.ChatMessagePart{
+			{Type: schema.ChatMessagePartTypeText, Text: "multi content"},
+		}
+		msg.AssistantGenMultiContent = []schema.MessageOutputPart{
+			{Type: schema.ChatMessagePartTypeText, Text: "assistant gen"},
+		}
+
+		result := copyMessages([]*schema.Message{msg})
+		assert.Len(t, result, 1)
+		assert.NotEqual(t, &msg, result[0])
+		assert.Len(t, result[0].ToolCalls, 1)
+		assert.Equal(t, "call_123", result[0].ToolCalls[0].ID)
+		assert.Equal(t, "test_value", result[0].Extra["test_key"])
+		assert.Len(t, result[0].UserInputMultiContent, 1)
+		assert.Len(t, result[0].MultiContent, 1)
+		assert.Len(t, result[0].AssistantGenMultiContent, 1)
+	})
+}
+
+func TestReductionMiddlewareEnhancedTrunc(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("enhanced invokable - passthrough when truncation skipped", func(t *testing.T) {
+		backend := filesystem.NewInMemoryBackend()
+		config := &Config{
+			Backend:        backend,
+			SkipTruncation: true,
+		}
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+
+		tCtx := &adk.ToolContext{Name: "enh_tool", CallID: "cid"}
+		toolArg := &schema.ToolArgument{Text: `{"k":"v"}`}
+
+		called := 0
+		endpoint := func(_ context.Context, ta *schema.ToolArgument, _ ...tool.Option) (*schema.ToolResult, error) {
+			called++
+			assert.Same(t, toolArg, ta)
+			return &schema.ToolResult{Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: "ok"}}}, nil
+		}
+
+		wrapped, err := mw.WrapEnhancedInvokableToolCall(ctx, endpoint, tCtx)
+		assert.NoError(t, err)
+		got, err := wrapped(ctx, toolArg)
+		assert.NoError(t, err)
+		assert.Equal(t, 1, called)
+		assert.Equal(t, "ok", got.Parts[0].Text)
+	})
+
+	t.Run("enhanced invokable - excluded tool bypasses truncation", func(t *testing.T) {
+		backend := filesystem.NewInMemoryBackend()
+		config := &Config{
+			Backend:           backend,
+			TruncExcludeTools: []string{"enh_tool"},
+			ToolConfig: map[string]*ToolReductionConfig{
+				"enh_tool": {
+					Backend:        backend,
+					SkipTruncation: false,
+					TruncHandler: func(_ context.Context, _ *ToolDetail) (*TruncResult, error) {
+						t.Fatalf("trunc handler should not be called when tool is excluded")
+						return nil, nil
+					},
+				},
+			},
+		}
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+
+		tCtx := &adk.ToolContext{Name: "enh_tool", CallID: "cid"}
+		toolArg := &schema.ToolArgument{Text: `{"k":"v"}`}
+		endpoint := func(_ context.Context, _ *schema.ToolArgument, _ ...tool.Option) (*schema.ToolResult, error) {
+			return &schema.ToolResult{Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: "orig"}}}, nil
+		}
+
+		wrapped, err := mw.WrapEnhancedInvokableToolCall(ctx, endpoint, tCtx)
+		assert.NoError(t, err)
+		got, err := wrapped(ctx, toolArg)
+		assert.NoError(t, err)
+		assert.Equal(t, "orig", got.Parts[0].Text)
+	})
+
+	t.Run("enhanced invokable - endpoint error returned", func(t *testing.T) {
+		backend := filesystem.NewInMemoryBackend()
+		wantErr := errors.New("endpoint error")
+
+		config := &Config{
+			Backend: backend,
+			ToolConfig: map[string]*ToolReductionConfig{
+				"enh_tool": {
+					Backend:        backend,
+					SkipTruncation: false,
+					TruncHandler: func(_ context.Context, _ *ToolDetail) (*TruncResult, error) {
+						t.Fatalf("trunc handler should not be called on endpoint error")
+						return nil, nil
+					},
+				},
+			},
+		}
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+
+		tCtx := &adk.ToolContext{Name: "enh_tool", CallID: "cid"}
+		toolArg := &schema.ToolArgument{Text: `{"k":"v"}`}
+		endpoint := func(_ context.Context, _ *schema.ToolArgument, _ ...tool.Option) (*schema.ToolResult, error) {
+			return nil, wantErr
+		}
+
+		wrapped, err := mw.WrapEnhancedInvokableToolCall(ctx, endpoint, tCtx)
+		assert.NoError(t, err)
+		_, err = wrapped(ctx, toolArg)
+		assert.Equal(t, wantErr, err)
+	})
+
+	t.Run("enhanced invokable - trunc handler error returned", func(t *testing.T) {
+		backend := filesystem.NewInMemoryBackend()
+		wantErr := errors.New("handler error")
+		config := &Config{
+			Backend: backend,
+			ToolConfig: map[string]*ToolReductionConfig{
+				"enh_tool": {
+					Backend:        backend,
+					SkipTruncation: false,
+					TruncHandler: func(_ context.Context, _ *ToolDetail) (*TruncResult, error) {
+						return nil, wantErr
+					},
+				},
+			},
+		}
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+
+		tCtx := &adk.ToolContext{Name: "enh_tool", CallID: "cid"}
+		toolArg := &schema.ToolArgument{Text: `{"k":"v"}`}
+		endpoint := func(_ context.Context, _ *schema.ToolArgument, _ ...tool.Option) (*schema.ToolResult, error) {
+			return &schema.ToolResult{Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: "orig"}}}, nil
+		}
+
+		wrapped, err := mw.WrapEnhancedInvokableToolCall(ctx, endpoint, tCtx)
+		assert.NoError(t, err)
+		_, err = wrapped(ctx, toolArg)
+		assert.Equal(t, wantErr, err)
+	})
+
+	t.Run("enhanced invokable - no trunc returns original result", func(t *testing.T) {
+		backend := filesystem.NewInMemoryBackend()
+		config := &Config{
+			Backend: backend,
+			ToolConfig: map[string]*ToolReductionConfig{
+				"enh_tool": {
+					Backend:        backend,
+					SkipTruncation: false,
+					TruncHandler: func(_ context.Context, detail *ToolDetail) (*TruncResult, error) {
+						assert.NotNil(t, detail.ToolResult)
+						assert.Equal(t, "orig", detail.ToolResult.Parts[0].Text)
+						return &TruncResult{NeedTrunc: false}, nil
+					},
+				},
+			},
+		}
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+
+		tCtx := &adk.ToolContext{Name: "enh_tool", CallID: "cid"}
+		toolArg := &schema.ToolArgument{Text: `{"k":"v"}`}
+		endpoint := func(_ context.Context, _ *schema.ToolArgument, _ ...tool.Option) (*schema.ToolResult, error) {
+			return &schema.ToolResult{Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: "orig"}}}, nil
+		}
+
+		wrapped, err := mw.WrapEnhancedInvokableToolCall(ctx, endpoint, tCtx)
+		assert.NoError(t, err)
+		got, err := wrapped(ctx, toolArg)
+		assert.NoError(t, err)
+		assert.Equal(t, "orig", got.Parts[0].Text)
+	})
+
+	t.Run("enhanced invokable - offload without backend returns error", func(t *testing.T) {
+		// config.Backend must be non-nil to pass New(), but the per-tool cfg.Backend is nil.
+		configBackend := filesystem.NewInMemoryBackend()
+		config := &Config{
+			Backend: configBackend,
+			ToolConfig: map[string]*ToolReductionConfig{
+				"enh_tool": {
+					Backend:        nil,
+					SkipTruncation: false,
+					TruncHandler: func(_ context.Context, _ *ToolDetail) (*TruncResult, error) {
+						return &TruncResult{
+							NeedTrunc:       true,
+							NeedOffload:     true,
+							OffloadFilePath: "/tmp/trunc/cid",
+							OffloadContent:  "big",
+							ToolResult:      &schema.ToolResult{Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: "trunc"}}},
+						}, nil
+					},
+				},
+			},
+		}
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+
+		tCtx := &adk.ToolContext{Name: "enh_tool", CallID: "cid"}
+		toolArg := &schema.ToolArgument{Text: `{"k":"v"}`}
+		endpoint := func(_ context.Context, _ *schema.ToolArgument, _ ...tool.Option) (*schema.ToolResult, error) {
+			return &schema.ToolResult{Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: "orig"}}}, nil
+		}
+
+		wrapped, err := mw.WrapEnhancedInvokableToolCall(ctx, endpoint, tCtx)
+		assert.NoError(t, err)
+		_, err = wrapped(ctx, toolArg)
+		assert.EqualError(t, err, "truncation: no backend for offload")
+	})
+
+	t.Run("enhanced invokable - trunc + offload writes and returns trunc result", func(t *testing.T) {
+		backend := filesystem.NewInMemoryBackend()
+		config := &Config{
+			Backend: backend,
+			ToolConfig: map[string]*ToolReductionConfig{
+				"enh_tool": {
+					Backend:        backend,
+					SkipTruncation: false,
+					TruncHandler: func(_ context.Context, detail *ToolDetail) (*TruncResult, error) {
+						assert.NotNil(t, detail.ToolContext)
+						assert.NotNil(t, detail.ToolArgument)
+						assert.NotNil(t, detail.ToolResult)
+						return &TruncResult{
+							NeedTrunc:       true,
+							NeedOffload:     true,
+							OffloadFilePath: "/tmp/trunc/cid",
+							OffloadContent:  "full content",
+							ToolResult:      &schema.ToolResult{Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: "truncated"}}},
+						}, nil
+					},
+				},
+			},
+		}
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+
+		tCtx := &adk.ToolContext{Name: "enh_tool", CallID: "cid"}
+		toolArg := &schema.ToolArgument{Text: `{"k":"v"}`}
+		endpoint := func(_ context.Context, ta *schema.ToolArgument, _ ...tool.Option) (*schema.ToolResult, error) {
+			assert.Same(t, toolArg, ta)
+			return &schema.ToolResult{Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: "orig"}}}, nil
+		}
+
+		wrapped, err := mw.WrapEnhancedInvokableToolCall(ctx, endpoint, tCtx)
+		assert.NoError(t, err)
+		got, err := wrapped(ctx, toolArg)
+		assert.NoError(t, err)
+		assert.Equal(t, "truncated", got.Parts[0].Text)
+
+		content, err := backend.Read(ctx, &filesystem.ReadRequest{FilePath: "/tmp/trunc/cid"})
+		assert.NoError(t, err)
+		assert.Equal(t, "full content", content.Content)
+	})
+
+	t.Run("enhanced streamable - no trunc returns original stream (Copy semantics)", func(t *testing.T) {
+		backend := filesystem.NewInMemoryBackend()
+		config := &Config{
+			Backend: backend,
+			ToolConfig: map[string]*ToolReductionConfig{
+				"enh_stream_tool": {
+					Backend:        backend,
+					SkipTruncation: false,
+					TruncHandler: func(_ context.Context, detail *ToolDetail) (*TruncResult, error) {
+						// Consume the "analysis" copy; the returned reader should still have the full stream.
+						parts, needProcess, err := getJointToolResult(detail)
+						assert.NoError(t, err)
+						assert.True(t, needProcess)
+						assert.Len(t, parts, 1)
+						assert.Equal(t, "hello world", parts[0].Text)
+						return &TruncResult{NeedTrunc: false}, nil
+					},
+				},
+			},
+		}
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+
+		tCtx := &adk.ToolContext{Name: "enh_stream_tool", CallID: "scid"}
+		toolArg := &schema.ToolArgument{Text: `{"k":"v"}`}
+		endpoint := func(_ context.Context, _ *schema.ToolArgument, _ ...tool.Option) (*schema.StreamReader[*schema.ToolResult], error) {
+			sr, sw := schema.Pipe[*schema.ToolResult](4)
+			go func() {
+				sw.Send(&schema.ToolResult{Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: "hello "}}}, nil)
+				sw.Send(&schema.ToolResult{Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: "world"}}}, nil)
+				sw.Close()
+			}()
+			return sr, nil
+		}
+
+		wrapped, err := mw.WrapEnhancedStreamableToolCall(ctx, endpoint, tCtx)
+		assert.NoError(t, err)
+		resp, err := wrapped(ctx, toolArg)
+		assert.NoError(t, err)
+		defer resp.Close()
+
+		var chunks []*schema.ToolResult
+		for {
+			tr, recvErr := resp.Recv()
+			if recvErr != nil {
+				assert.Equal(t, io.EOF, recvErr)
+				break
+			}
+			chunks = append(chunks, tr)
+		}
+		joined, err := schema.ConcatToolResults(chunks)
+		assert.NoError(t, err)
+		assert.Equal(t, "hello world", joined.Parts[0].Text)
+	})
+
+	t.Run("enhanced streamable - trunc + offload writes and returns trunc stream", func(t *testing.T) {
+		backend := filesystem.NewInMemoryBackend()
+		config := &Config{
+			Backend: backend,
+			ToolConfig: map[string]*ToolReductionConfig{
+				"enh_stream_tool": {
+					Backend:        backend,
+					SkipTruncation: false,
+					TruncHandler: func(_ context.Context, _ *ToolDetail) (*TruncResult, error) {
+						sr, sw := schema.Pipe[*schema.ToolResult](1)
+						sw.Send(&schema.ToolResult{Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: "truncated"}}}, nil)
+						sw.Close()
+						return &TruncResult{
+							NeedTrunc:        true,
+							NeedOffload:      true,
+							OffloadFilePath:  "/tmp/trunc/scid",
+							OffloadContent:   "full content",
+							StreamToolResult: sr,
+						}, nil
+					},
+				},
+			},
+		}
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+
+		tCtx := &adk.ToolContext{Name: "enh_stream_tool", CallID: "scid"}
+		toolArg := &schema.ToolArgument{Text: `{"k":"v"}`}
+		endpoint := func(_ context.Context, _ *schema.ToolArgument, _ ...tool.Option) (*schema.StreamReader[*schema.ToolResult], error) {
+			sr, sw := schema.Pipe[*schema.ToolResult](2)
+			sw.Send(&schema.ToolResult{Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: "orig"}}}, nil)
+			sw.Close()
+			return sr, nil
+		}
+
+		wrapped, err := mw.WrapEnhancedStreamableToolCall(ctx, endpoint, tCtx)
+		assert.NoError(t, err)
+		resp, err := wrapped(ctx, toolArg)
+		assert.NoError(t, err)
+		defer resp.Close()
+
+		tr, err := resp.Recv()
+		assert.NoError(t, err)
+		assert.Equal(t, "truncated", tr.Parts[0].Text)
+
+		_, err = resp.Recv()
+		assert.Equal(t, io.EOF, err)
+
+		content, err := backend.Read(ctx, &filesystem.ReadRequest{FilePath: "/tmp/trunc/scid"})
+		assert.NoError(t, err)
+		assert.Equal(t, "full content", content.Content)
+	})
+
+	t.Run("enhanced streamable - endpoint error returned", func(t *testing.T) {
+		backend := filesystem.NewInMemoryBackend()
+		wantErr := errors.New("endpoint error")
+		config := &Config{
+			Backend: backend,
+			ToolConfig: map[string]*ToolReductionConfig{
+				"enh_stream_tool": {
+					Backend:        backend,
+					SkipTruncation: false,
+					TruncHandler: func(_ context.Context, _ *ToolDetail) (*TruncResult, error) {
+						t.Fatalf("trunc handler should not be called on endpoint error")
+						return nil, nil
+					},
+				},
+			},
+		}
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+
+		tCtx := &adk.ToolContext{Name: "enh_stream_tool", CallID: "scid"}
+		toolArg := &schema.ToolArgument{Text: `{"k":"v"}`}
+		endpoint := func(_ context.Context, _ *schema.ToolArgument, _ ...tool.Option) (*schema.StreamReader[*schema.ToolResult], error) {
+			return nil, wantErr
+		}
+
+		wrapped, err := mw.WrapEnhancedStreamableToolCall(ctx, endpoint, tCtx)
+		assert.NoError(t, err)
+		_, err = wrapped(ctx, toolArg)
+		assert.Equal(t, wantErr, err)
+	})
+
+	t.Run("enhanced streamable - trunc handler error returned", func(t *testing.T) {
+		backend := filesystem.NewInMemoryBackend()
+		wantErr := errors.New("handler error")
+		config := &Config{
+			Backend: backend,
+			ToolConfig: map[string]*ToolReductionConfig{
+				"enh_stream_tool": {
+					Backend:        backend,
+					SkipTruncation: false,
+					TruncHandler: func(_ context.Context, _ *ToolDetail) (*TruncResult, error) {
+						return nil, wantErr
+					},
+				},
+			},
+		}
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+
+		tCtx := &adk.ToolContext{Name: "enh_stream_tool", CallID: "scid"}
+		toolArg := &schema.ToolArgument{Text: `{"k":"v"}`}
+		endpoint := func(_ context.Context, _ *schema.ToolArgument, _ ...tool.Option) (*schema.StreamReader[*schema.ToolResult], error) {
+			sr, sw := schema.Pipe[*schema.ToolResult](1)
+			sw.Send(&schema.ToolResult{Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: "orig"}}}, nil)
+			sw.Close()
+			return sr, nil
+		}
+
+		wrapped, err := mw.WrapEnhancedStreamableToolCall(ctx, endpoint, tCtx)
+		assert.NoError(t, err)
+		_, err = wrapped(ctx, toolArg)
+		assert.Equal(t, wantErr, err)
+	})
+
+	t.Run("enhanced streamable - offload without backend returns error", func(t *testing.T) {
+		// config.Backend must be non-nil to pass New(), but the per-tool cfg.Backend is nil.
+		configBackend := filesystem.NewInMemoryBackend()
+		config := &Config{
+			Backend: configBackend,
+			ToolConfig: map[string]*ToolReductionConfig{
+				"enh_stream_tool": {
+					Backend:        nil,
+					SkipTruncation: false,
+					TruncHandler: func(_ context.Context, _ *ToolDetail) (*TruncResult, error) {
+						sr, sw := schema.Pipe[*schema.ToolResult](1)
+						sw.Send(&schema.ToolResult{Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: "truncated"}}}, nil)
+						sw.Close()
+						return &TruncResult{
+							NeedTrunc:        true,
+							NeedOffload:      true,
+							OffloadFilePath:  "/tmp/trunc/scid",
+							OffloadContent:   "full content",
+							StreamToolResult: sr,
+						}, nil
+					},
+				},
+			},
+		}
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+
+		tCtx := &adk.ToolContext{Name: "enh_stream_tool", CallID: "scid"}
+		toolArg := &schema.ToolArgument{Text: `{"k":"v"}`}
+		endpoint := func(_ context.Context, _ *schema.ToolArgument, _ ...tool.Option) (*schema.StreamReader[*schema.ToolResult], error) {
+			sr, sw := schema.Pipe[*schema.ToolResult](1)
+			sw.Send(&schema.ToolResult{Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: "orig"}}}, nil)
+			sw.Close()
+			return sr, nil
+		}
+
+		wrapped, err := mw.WrapEnhancedStreamableToolCall(ctx, endpoint, tCtx)
+		assert.NoError(t, err)
+		_, err = wrapped(ctx, toolArg)
+		assert.EqualError(t, err, "truncation: no backend for offload")
+	})
+}
+
+func TestClearRewriteMessagesHandler(t *testing.T) {
+	ctx := context.Background()
+	it := mockInvokableTool()
+	st := mockStreamableTool()
+	tools := []tool.BaseTool{it, st}
+	var toolsInfo []*schema.ToolInfo
+	for _, bt := range tools {
+		ti, _ := bt.Info(ctx)
+		toolsInfo = append(toolsInfo, ti)
+	}
+
+	tokenCounter := func(_ context.Context, msgs []adk.Message, _ []*schema.ToolInfo) (int64, error) {
+		return int64(1000), nil
+	}
+
+	t.Run("test all tools hit - rewrite to system reminder", func(t *testing.T) {
+		config := &Config{
+			SkipTruncation:     true,
+			TokenCounter:       tokenCounter,
+			MaxTokensForClear:  10,
+			ClearAtLeastTokens: 0,
+			ClearMessageRewriter: func(ctx context.Context, assistantMessage adk.Message, toolResponses []adk.Message) (messagesAfterRewrite []adk.Message, err error) {
+				return []adk.Message{
+					schema.UserMessage("<system-reminder>write_file and edit_file executed successfully</system-reminder>"),
+				}, nil
+			},
+		}
+
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+		_, s, err := mw.BeforeModelRewriteState(ctx, &adk.ChatModelAgentState{
+			Messages: []adk.Message{
+				schema.SystemMessage("you are a helpful assistant"),
+				schema.UserMessage("user request"),
+				schema.AssistantMessage("", []schema.ToolCall{
+					{
+						ID:       "call_1",
+						Type:     "function",
+						Function: schema.FunctionCall{Name: "write_file", Arguments: `{"file": "test.txt", "content": "hello"}`},
+					},
+					{
+						ID:       "call_2",
+						Type:     "function",
+						Function: schema.FunctionCall{Name: "edit_file", Arguments: `{"file": "test.txt", "changes": "add"}`},
+					},
+				}),
+				schema.ToolMessage("write success", "call_1"),
+				schema.ToolMessage("edit success", "call_2"),
+				schema.AssistantMessage("done", nil),
+				schema.AssistantMessage("", []schema.ToolCall{{ID: "dummy", Type: "function", Function: schema.FunctionCall{Name: "dummy_tool"}}}),
+			},
+		}, &adk.ModelContext{
+			Tools: toolsInfo,
+		})
+		assert.NoError(t, err)
+		assert.Len(t, s.Messages, 5)
+		assert.Equal(t, schema.User, s.Messages[2].Role)
+		assert.Equal(t, "<system-reminder>write_file and edit_file executed successfully</system-reminder>", s.Messages[2].Content)
+		assert.Equal(t, schema.Assistant, s.Messages[3].Role)
+		assert.Equal(t, "done", s.Messages[3].Content)
+	})
+
+	t.Run("test remove tool call and tool responses", func(t *testing.T) {
+		config := &Config{
+			SkipTruncation:     true,
+			TokenCounter:       tokenCounter,
+			MaxTokensForClear:  10,
+			ClearAtLeastTokens: 0,
+			ClearMessageRewriter: func(ctx context.Context, assistantMessage adk.Message, toolResponses []adk.Message) (messagesAfterRewrite []adk.Message, err error) {
+				return []adk.Message{}, nil
+			},
+		}
+
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+		_, s, err := mw.BeforeModelRewriteState(ctx, &adk.ChatModelAgentState{
+			Messages: []adk.Message{
+				schema.SystemMessage("you are a helpful assistant"),
+				schema.UserMessage("user request"),
+				schema.AssistantMessage("", []schema.ToolCall{
+					{
+						ID:       "call_1",
+						Type:     "function",
+						Function: schema.FunctionCall{Name: "write_file", Arguments: `{"file": "test.txt", "content": "hello"}`},
+					},
+					{
+						ID:       "call_2",
+						Type:     "function",
+						Function: schema.FunctionCall{Name: "edit_file", Arguments: `{"file": "test.txt", "changes": "add"}`},
+					},
+				}),
+				schema.ToolMessage("write success", "call_1"),
+				schema.ToolMessage("edit success", "call_2"),
+				schema.AssistantMessage("", []schema.ToolCall{{ID: "dummy", Type: "function", Function: schema.FunctionCall{Name: "dummy_tool"}}}),
+				schema.ToolMessage("dummy dummy", "dummy"),
+				schema.AssistantMessage("done", nil),
+			},
+		}, &adk.ModelContext{
+			Tools: toolsInfo,
+		})
+		assert.NoError(t, err)
+		assert.Len(t, s.Messages, 5)
+		assert.Equal(t, schema.Assistant, s.Messages[2].Role)
+		assert.Equal(t, schema.Tool, s.Messages[3].Role)
+		assert.Equal(t, "dummy dummy", s.Messages[3].Content)
+		assert.Equal(t, schema.Assistant, s.Messages[4].Role)
+		assert.Equal(t, "done", s.Messages[4].Content)
+	})
+
+	t.Run("test partial tools hit - keep unhit tools and rewrite hit ones", func(t *testing.T) {
+		config := &Config{
+			SkipTruncation:     true,
+			TokenCounter:       tokenCounter,
+			MaxTokensForClear:  10,
+			ClearAtLeastTokens: 0,
+			ClearExcludeTools:  []string{"get_weather"},
+			ClearMessageRewriter: func(ctx context.Context, assistantMessage adk.Message, toolResponses []adk.Message) (messagesAfterRewrite []adk.Message, err error) {
+				hitToolIDs := map[string]bool{"call_1": true}
+
+				newToolCalls := make([]schema.ToolCall, 0)
+				newToolResponses := make([]adk.Message, 0)
+
+				for i, tc := range assistantMessage.ToolCalls {
+					if !hitToolIDs[tc.ID] {
+						newToolCalls = append(newToolCalls, tc)
+						if i < len(toolResponses) {
+							newToolResponses = append(newToolResponses, toolResponses[i])
+						}
+					}
+				}
+
+				result := []adk.Message{
+					schema.UserMessage("<system-reminder>write_file executed successfully</system-reminder>"),
+				}
+				if len(newToolCalls) > 0 {
+					result = append(result, schema.AssistantMessage("", newToolCalls))
+					result = append(result, newToolResponses...)
+				}
+				return result, nil
+			},
+		}
+
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+		_, s, err := mw.BeforeModelRewriteState(ctx, &adk.ChatModelAgentState{
+			Messages: []adk.Message{
+				schema.SystemMessage("you are a helpful assistant"),
+				schema.UserMessage("user request"),
+				schema.AssistantMessage("", []schema.ToolCall{
+					{
+						ID:       "call_1",
+						Type:     "function",
+						Function: schema.FunctionCall{Name: "write_file", Arguments: `{"file": "test.txt", "content": "hello"}`},
+					},
+					{
+						ID:       "call_2",
+						Type:     "function",
+						Function: schema.FunctionCall{Name: "get_weather", Arguments: `{"location": "London"}`},
+					},
+				}),
+				schema.ToolMessage("write success", "call_1"),
+				schema.ToolMessage("sunny", "call_2"),
+				schema.AssistantMessage("", []schema.ToolCall{{ID: "dummy", Type: "function", Function: schema.FunctionCall{Name: "dummy_tool"}}}),
+			},
+		}, &adk.ModelContext{
+			Tools: toolsInfo,
+		})
+		assert.NoError(t, err)
+		assert.Len(t, s.Messages, 6)
+		assert.Equal(t, schema.User, s.Messages[2].Role)
+		assert.Equal(t, "<system-reminder>write_file executed successfully</system-reminder>", s.Messages[2].Content)
+		assert.Equal(t, schema.Assistant, s.Messages[3].Role)
+		assert.Len(t, s.Messages[3].ToolCalls, 1)
+		assert.Equal(t, "call_2", s.Messages[3].ToolCalls[0].ID)
+		assert.Equal(t, schema.Tool, s.Messages[4].Role)
+		assert.Equal(t, "sunny", s.Messages[4].Content)
+	})
+
+	t.Run("test mixed messages with system/user before", func(t *testing.T) {
+		config := &Config{
+			SkipTruncation:     true,
+			TokenCounter:       tokenCounter,
+			MaxTokensForClear:  10,
+			ClearAtLeastTokens: 0,
+			ClearMessageRewriter: func(ctx context.Context, assistantMessage adk.Message, toolResponses []adk.Message) (messagesAfterRewrite []adk.Message, err error) {
+				return []adk.Message{
+					schema.UserMessage("<system-reminder>tool executed</system-reminder>"),
+				}, nil
+			},
+		}
+
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+		_, s, err := mw.BeforeModelRewriteState(ctx, &adk.ChatModelAgentState{
+			Messages: []adk.Message{
+				schema.SystemMessage("you are a helpful assistant"),
+				schema.UserMessage("first request"),
+				schema.AssistantMessage("", []schema.ToolCall{
+					{
+						ID:       "call_1",
+						Type:     "function",
+						Function: schema.FunctionCall{Name: "write_file", Arguments: `{"file": "test.txt"}`},
+					},
+				}),
+				schema.ToolMessage("success", "call_1"),
+				schema.UserMessage("second request"),
+				schema.AssistantMessage("", []schema.ToolCall{{ID: "dummy", Type: "function", Function: schema.FunctionCall{Name: "dummy_tool"}}}),
+			},
+		}, &adk.ModelContext{
+			Tools: toolsInfo,
+		})
+		assert.NoError(t, err)
+		assert.Len(t, s.Messages, 5)
+		assert.Equal(t, schema.System, s.Messages[0].Role)
+		assert.Equal(t, schema.User, s.Messages[1].Role)
+		assert.Equal(t, schema.User, s.Messages[2].Role)
+		assert.Equal(t, "<system-reminder>tool executed</system-reminder>", s.Messages[2].Content)
+		assert.Equal(t, schema.User, s.Messages[3].Role)
+	})
+
+	t.Run("test mixed messages with system/user before", func(t *testing.T) {
+		config := &Config{
+			SkipTruncation:     true,
+			TokenCounter:       tokenCounter,
+			MaxTokensForClear:  10,
+			ClearAtLeastTokens: 0,
+			ClearMessageRewriter: func(ctx context.Context, assistantMessage adk.Message, toolResponses []adk.Message) (messagesAfterRewrite []adk.Message, err error) {
+				return []adk.Message{
+					schema.UserMessage("<system-reminder>tool executed</system-reminder>"),
+				}, nil
+			},
+		}
+
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+		_, s, err := mw.BeforeModelRewriteState(ctx, &adk.ChatModelAgentState{
+			Messages: []adk.Message{
+				schema.SystemMessage("you are a helpful assistant"),
+				schema.UserMessage("first request"),
+				schema.AssistantMessage("", []schema.ToolCall{
+					{
+						ID:       "call_1",
+						Type:     "function",
+						Function: schema.FunctionCall{Name: "write_file", Arguments: `{"file": "test.txt"}`},
+					},
+				}),
+				schema.ToolMessage("success", "call_1"),
+				schema.UserMessage("second request"),
+				schema.AssistantMessage("", []schema.ToolCall{{ID: "dummy", Type: "function", Function: schema.FunctionCall{Name: "dummy_tool"}}}),
+			},
+		}, &adk.ModelContext{
+			Tools: toolsInfo,
+		})
+		assert.NoError(t, err)
+		assert.Len(t, s.Messages, 5)
+		assert.Equal(t, schema.System, s.Messages[0].Role)
+		assert.Equal(t, schema.User, s.Messages[1].Role)
+		assert.Equal(t, schema.User, s.Messages[2].Role)
+		assert.Equal(t, "<system-reminder>tool executed</system-reminder>", s.Messages[2].Content)
+		assert.Equal(t, schema.User, s.Messages[3].Role)
+	})
+
+	t.Run("test assistant message without tool calls - keep as is", func(t *testing.T) {
+		handlerCalled := false
+		config := &Config{
+			SkipTruncation:     true,
+			TokenCounter:       tokenCounter,
+			MaxTokensForClear:  10,
+			ClearAtLeastTokens: 0,
+			ClearMessageRewriter: func(ctx context.Context, assistantMessage adk.Message, toolResponses []adk.Message) (messagesAfterRewrite []adk.Message, err error) {
+				handlerCalled = true
+				return nil, nil
+			},
+		}
+
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+		_, s, err := mw.BeforeModelRewriteState(ctx, &adk.ChatModelAgentState{
+			Messages: []adk.Message{
+				schema.SystemMessage("you are a helpful assistant"),
+				schema.UserMessage("user request"),
+				schema.AssistantMessage("regular response without tools", nil),
+				schema.AssistantMessage("", []schema.ToolCall{{ID: "dummy", Type: "function", Function: schema.FunctionCall{Name: "dummy_tool"}}}),
+			},
+		}, &adk.ModelContext{
+			Tools: toolsInfo,
+		})
+		assert.NoError(t, err)
+		assert.False(t, handlerCalled)
+		assert.Len(t, s.Messages, 4)
+		assert.Equal(t, schema.Assistant, s.Messages[2].Role)
+		assert.Equal(t, "regular response without tools", s.Messages[2].Content)
+	})
+
+	t.Run("test clear not meeting threshold - should keep original messages", func(t *testing.T) {
+		originalTokenCount := int64(1000)
+		rewrittenTokenCount := int64(999)
+		callCount := 0
+
+		config := &Config{
+			SkipTruncation: true,
+			TokenCounter: func(_ context.Context, msgs []adk.Message, _ []*schema.ToolInfo) (int64, error) {
+				callCount++
+				if callCount == 1 {
+					return originalTokenCount, nil
+				}
+				return rewrittenTokenCount, nil
+			},
+			MaxTokensForClear:  10,
+			ClearAtLeastTokens: 10,
+			ClearMessageRewriter: func(ctx context.Context, assistantMessage adk.Message, toolResponses []adk.Message) (messagesAfterRewrite []adk.Message, err error) {
+				return []adk.Message{
+					schema.UserMessage("<system-reminder>tool executed</system-reminder>"),
+				}, nil
+			},
+		}
+
+		originalMessages := []adk.Message{
+			schema.SystemMessage("you are a helpful assistant"),
+			schema.UserMessage("user request"),
+			schema.AssistantMessage("", []schema.ToolCall{
+				{
+					ID:       "call_1",
+					Type:     "function",
+					Function: schema.FunctionCall{Name: "write_file", Arguments: `{"file": "test.txt"}`},
+				},
+			}),
+			schema.ToolMessage("success", "call_1"),
+			schema.AssistantMessage("", []schema.ToolCall{{ID: "dummy", Type: "function", Function: schema.FunctionCall{Name: "dummy_tool"}}}),
+		}
+
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+		_, s, err := mw.BeforeModelRewriteState(ctx, &adk.ChatModelAgentState{
+			Messages: originalMessages,
+		}, &adk.ModelContext{
+			Tools: toolsInfo,
+		})
+		assert.NoError(t, err)
+		assert.Len(t, s.Messages, len(originalMessages))
+		for i := range originalMessages {
+			assert.Equal(t, originalMessages[i].Role, s.Messages[i].Role)
+			assert.Equal(t, originalMessages[i].Content, s.Messages[i].Content)
+		}
+	})
+
+	t.Run("test applyClearRewrite with default role", func(t *testing.T) {
+		config := &Config{
+			SkipTruncation:     true,
+			TokenCounter:       tokenCounter,
+			MaxTokensForClear:  10,
+			ClearAtLeastTokens: 0,
+			ClearMessageRewriter: func(ctx context.Context, assistantMessage adk.Message, toolResponses []adk.Message) (messagesAfterRewrite []adk.Message, err error) {
+				return []adk.Message{}, nil
+			},
+		}
+
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+
+		unknownRoleMsg := &schema.Message{
+			Role:    "unknown_role",
+			Content: "unknown",
+		}
+
+		_, s, err := mw.BeforeModelRewriteState(ctx, &adk.ChatModelAgentState{
+			Messages: []adk.Message{
+				schema.SystemMessage("you are a helpful assistant"),
+				schema.UserMessage("user request"),
+				unknownRoleMsg,
+				schema.AssistantMessage("", []schema.ToolCall{{ID: "dummy", Type: "function", Function: schema.FunctionCall{Name: "dummy_tool"}}}),
+			},
+		}, &adk.ModelContext{
+			Tools: toolsInfo,
+		})
+		assert.NoError(t, err)
+		assert.NotNil(t, s)
+	})
+
+	t.Run("test applyClearRewrite with rewrite error", func(t *testing.T) {
+		expectedErr := fmt.Errorf("rewrite error")
+		config := &Config{
+			SkipTruncation:     true,
+			TokenCounter:       tokenCounter,
+			MaxTokensForClear:  10,
+			ClearAtLeastTokens: 0,
+			ClearMessageRewriter: func(ctx context.Context, assistantMessage adk.Message, toolResponses []adk.Message) (messagesAfterRewrite []adk.Message, err error) {
+				return nil, expectedErr
+			},
+		}
+
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+
+		_, _, err = mw.BeforeModelRewriteState(ctx, &adk.ChatModelAgentState{
+			Messages: []adk.Message{
+				schema.SystemMessage("you are a helpful assistant"),
+				schema.UserMessage("user request"),
+				schema.AssistantMessage("", []schema.ToolCall{
+					{
+						ID:       "call_1",
+						Type:     "function",
+						Function: schema.FunctionCall{Name: "write_file", Arguments: `{"file": "test.txt"}`},
+					},
+				}),
+				schema.ToolMessage("success", "call_1"),
+				schema.AssistantMessage("", []schema.ToolCall{{ID: "dummy", Type: "function", Function: schema.FunctionCall{Name: "dummy_tool"}}}),
+			},
+		}, &adk.ModelContext{
+			Tools: toolsInfo,
+		})
+		assert.Error(t, err)
+		assert.Equal(t, expectedErr, err)
+	})
+
+	t.Run("test applyClearRewrite with missing tool responses", func(t *testing.T) {
+		config := &Config{
+			SkipTruncation:     true,
+			TokenCounter:       tokenCounter,
+			MaxTokensForClear:  10,
+			ClearAtLeastTokens: 0,
+			ClearMessageRewriter: func(ctx context.Context, assistantMessage adk.Message, toolResponses []adk.Message) (messagesAfterRewrite []adk.Message, err error) {
+				assert.Nil(t, toolResponses)
+				return []adk.Message{
+					schema.UserMessage("<system-reminder>tool executed</system-reminder>"),
+				}, nil
+			},
+		}
+
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+		_, s, err := mw.BeforeModelRewriteState(ctx, &adk.ChatModelAgentState{
+			Messages: []adk.Message{
+				schema.SystemMessage("you are a helpful assistant"),
+				schema.UserMessage("user request"),
+				schema.AssistantMessage("", []schema.ToolCall{
+					{
+						ID:       "call_1",
+						Type:     "function",
+						Function: schema.FunctionCall{Name: "write_file", Arguments: `{"file": "test.txt"}`},
+					},
+				}),
+				schema.AssistantMessage("", []schema.ToolCall{{ID: "dummy", Type: "function", Function: schema.FunctionCall{Name: "dummy_tool"}}}),
+			},
+		}, &adk.ModelContext{
+			Tools: toolsInfo,
+		})
+		assert.NoError(t, err)
+		assert.NotNil(t, s)
+	})
+
+	t.Run("test applyClearRewrite with clearAtLeastTokens > 0", func(t *testing.T) {
+		config := &Config{
+			SkipTruncation:     true,
+			TokenCounter:       tokenCounter,
+			MaxTokensForClear:  10,
+			ClearAtLeastTokens: 10,
+			ClearMessageRewriter: func(ctx context.Context, assistantMessage adk.Message, toolResponses []adk.Message) (messagesAfterRewrite []adk.Message, err error) {
+				return []adk.Message{
+					schema.UserMessage("<system-reminder>tool executed</system-reminder>"),
+				}, nil
+			},
+		}
+
+		mw, err := New(ctx, config)
+		assert.NoError(t, err)
+		_, s, err := mw.BeforeModelRewriteState(ctx, &adk.ChatModelAgentState{
+			Messages: []adk.Message{
+				schema.SystemMessage("you are a helpful assistant"),
+				schema.UserMessage("user request"),
+				schema.AssistantMessage("", []schema.ToolCall{
+					{
+						ID:       "call_1",
+						Type:     "function",
+						Function: schema.FunctionCall{Name: "write_file", Arguments: `{"file": "test.txt"}`},
+					},
+				}),
+				schema.ToolMessage("success", "call_1"),
+				schema.AssistantMessage("", []schema.ToolCall{{ID: "dummy", Type: "function", Function: schema.FunctionCall{Name: "dummy_tool"}}}),
+			},
+		}, &adk.ModelContext{
+			Tools: toolsInfo,
+		})
+		assert.NoError(t, err)
+		assert.NotNil(t, s)
+	})
+}
+
+func TestNewTypedAgenticMessage(t *testing.T) {
+	ctx := context.Background()
+	mw, err := NewTyped(ctx, &TypedConfig[*schema.AgenticMessage]{
+		SkipTruncation: true,
+		SkipClear:      true,
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, mw)
+
+	var _ adk.TypedChatModelAgentMiddleware[*schema.AgenticMessage] = mw
 }

@@ -36,6 +36,10 @@ type deterministicTransferState struct {
 }
 
 // AgentWithDeterministicTransferTo wraps an agent to transfer to given agents deterministically.
+//
+// NOT RECOMMENDED: Agent transfer with full context sharing between agents has not proven
+// to be more effective empirically. Consider using ChatModelAgent with AgentTool
+// or DeepAgent instead for most multi-agent scenarios.
 func AgentWithDeterministicTransferTo(_ context.Context, config *DeterministicTransferConfig) Agent {
 	if ra, ok := config.Agent.(ResumableAgent); ok {
 		return &resumableAgentWithDeterministicTransferTo{
@@ -246,7 +250,7 @@ func handleFlowAgentEvents(ctx context.Context, iter *AsyncIterator[*AgentEvent]
 		}
 
 		if parentSession != nil && (event.Action == nil || event.Action.Interrupted == nil) {
-			copied := copyAgentEvent(event)
+			copied := copyTypedAgentEvent(event)
 			setAutomaticClose(copied)
 			setAutomaticClose(event)
 			parentSession.addEvent(copied)

@@ -28,6 +28,7 @@ import (
 
 	"github.com/nikolalohinski/gonja"
 	"github.com/nikolalohinski/gonja/config"
+	"github.com/nikolalohinski/gonja/exec"
 	"github.com/nikolalohinski/gonja/nodes"
 	"github.com/nikolalohinski/gonja/parser"
 	"github.com/slongfield/pyfmt"
@@ -40,47 +41,56 @@ func init() {
 	internal.RegisterStreamChunkConcatFunc(ConcatMessages)
 	internal.RegisterStreamChunkConcatFunc(ConcatMessageArray)
 
+	internal.RegisterStreamChunkConcatFunc(ConcatAgenticMessages)
+	internal.RegisterStreamChunkConcatFunc(ConcatAgenticMessagesArray)
+
 	internal.RegisterStreamChunkConcatFunc(ConcatToolResults)
+}
+
+func buildConcatGenericArray[T any](f func([]*T) (*T, error)) func([][]*T) ([]*T, error) {
+	return func(mas [][]*T) ([]*T, error) {
+		arrayLen := len(mas[0])
+
+		ret := make([]*T, arrayLen)
+		slicesToConcat := make([][]*T, arrayLen)
+
+		for _, ma := range mas {
+			if len(ma) != arrayLen {
+				return nil, fmt.Errorf("unexpected array length. "+
+					"Got %d, expected %d", len(ma), arrayLen)
+			}
+
+			for i := 0; i < arrayLen; i++ {
+				m := ma[i]
+				if m != nil {
+					slicesToConcat[i] = append(slicesToConcat[i], m)
+				}
+			}
+		}
+
+		for i, slice := range slicesToConcat {
+			if len(slice) == 0 {
+				ret[i] = nil
+			} else if len(slice) == 1 {
+				ret[i] = slice[0]
+			} else {
+				cm, err := f(slice)
+				if err != nil {
+					return nil, err
+				}
+
+				ret[i] = cm
+			}
+		}
+
+		return ret, nil
+	}
 }
 
 // ConcatMessageArray merges aligned slices of messages into a single slice,
 // concatenating messages at the same index across the input arrays.
 func ConcatMessageArray(mas [][]*Message) ([]*Message, error) {
-	arrayLen := len(mas[0])
-
-	ret := make([]*Message, arrayLen)
-	slicesToConcat := make([][]*Message, arrayLen)
-
-	for _, ma := range mas {
-		if len(ma) != arrayLen {
-			return nil, fmt.Errorf("unexpected array length. "+
-				"Got %d, expected %d", len(ma), arrayLen)
-		}
-
-		for i := 0; i < arrayLen; i++ {
-			m := ma[i]
-			if m != nil {
-				slicesToConcat[i] = append(slicesToConcat[i], m)
-			}
-		}
-	}
-
-	for i, slice := range slicesToConcat {
-		if len(slice) == 0 {
-			ret[i] = nil
-		} else if len(slice) == 1 {
-			ret[i] = slice[0]
-		} else {
-			cm, err := ConcatMessages(slice)
-			if err != nil {
-				return nil, err
-			}
-
-			ret[i] = cm
-		}
-	}
-
-	return ret, nil
+	return buildConcatGenericArray[Message](ConcatMessages)(mas)
 }
 
 // FormatType used by MessageTemplate.Format
@@ -130,7 +140,6 @@ type ToolCall struct {
 	Type string `json:"type"`
 	// Function is the function call to be made.
 	Function FunctionCall `json:"function"`
-
 	// Extra is used to store extra information for the tool call.
 	Extra map[string]any `json:"extra,omitempty"`
 }
@@ -213,6 +222,9 @@ type MessageInputPart struct {
 	// File is the file input of the part, it's used when Type is "file_url".
 	File *MessageInputFile `json:"file,omitempty"`
 
+	// ToolSearchResult holds the result of a tool search request, containing the matched tool names and their definitions.
+	ToolSearchResult *ToolSearchResult `json:"tool_search_result,omitempty"`
+
 	// Extra is used to store extra information.
 	Extra map[string]any `json:"extra,omitempty"`
 }
@@ -282,176 +294,6 @@ type MessageOutputPart struct {
 	StreamingMeta *MessageStreamingMeta `json:"-"`
 }
 
-// ToolPartType defines the type of content in a tool output part.
-// It is used to distinguish between different types of multimodal content returned by tools.
-type ToolPartType string
-
-const (
-	// ToolPartTypeText means the part is a text.
-	ToolPartTypeText ToolPartType = "text"
-
-	// ToolPartTypeImage means the part is an image url.
-	ToolPartTypeImage ToolPartType = "image"
-
-	// ToolPartTypeAudio means the part is an audio url.
-	ToolPartTypeAudio ToolPartType = "audio"
-
-	// ToolPartTypeVideo means the part is a video url.
-	ToolPartTypeVideo ToolPartType = "video"
-
-	// ToolPartTypeFile means the part is a file url.
-	ToolPartTypeFile ToolPartType = "file"
-)
-
-// ToolOutputImage represents an image in tool output.
-// It contains URL or Base64-encoded data along with MIME type information.
-type ToolOutputImage struct {
-	MessagePartCommon
-}
-
-// ToolOutputAudio represents an audio file in tool output.
-// It contains URL or Base64-encoded data along with MIME type information.
-type ToolOutputAudio struct {
-	MessagePartCommon
-}
-
-// ToolOutputVideo represents a video file in tool output.
-// It contains URL or Base64-encoded data along with MIME type information.
-type ToolOutputVideo struct {
-	MessagePartCommon
-}
-
-// ToolOutputFile represents a generic file in tool output.
-// It contains URL or Base64-encoded data along with MIME type information.
-type ToolOutputFile struct {
-	MessagePartCommon
-}
-
-// ToolOutputPart represents a part of tool execution output.
-// It supports streaming scenarios through the Index field for chunk merging.
-type ToolOutputPart struct {
-
-	// Type is the type of the part, e.g., "text", "image_url", "audio_url", "video_url".
-	Type ToolPartType `json:"type"`
-
-	// Text is the text content, used when Type is "text".
-	Text string `json:"text,omitempty"`
-
-	// Image is the image content, used when Type is ToolPartTypeImage.
-	Image *ToolOutputImage `json:"image,omitempty"`
-
-	// Audio is the audio content, used when Type is ToolPartTypeAudio.
-	Audio *ToolOutputAudio `json:"audio,omitempty"`
-
-	// Video is the video content, used when Type is ToolPartTypeVideo.
-	Video *ToolOutputVideo `json:"video,omitempty"`
-
-	// File is the file content, used when Type is ToolPartTypeFile.
-	File *ToolOutputFile `json:"file,omitempty"`
-
-	// Extra is used to store extra information.
-	Extra map[string]any `json:"extra,omitempty"`
-}
-
-// ToolArgument contains the input information for a tool call.
-// It is used to pass tool call arguments to enhanced tools.
-type ToolArgument struct {
-	// Text contains the arguments for the tool call in JSON format.
-	Text string `json:"text,omitempty"`
-}
-
-// ToolResult represents the structured multimodal output from a tool execution.
-// It is used when a tool needs to return more than just a simple string,
-// such as images, files, or other structured data.
-type ToolResult struct {
-	// Parts contains the multimodal output parts. Each part can be a different
-	// type of content, like text, an image, or a file.
-	Parts []ToolOutputPart `json:"parts,omitempty"`
-}
-
-func convToolOutputPartToMessageInputPart(toolPart ToolOutputPart) (MessageInputPart, error) {
-	switch toolPart.Type {
-	case ToolPartTypeText:
-		return MessageInputPart{
-			Type:  ChatMessagePartTypeText,
-			Text:  toolPart.Text,
-			Extra: toolPart.Extra,
-		}, nil
-	case ToolPartTypeImage:
-		if toolPart.Image == nil {
-			return MessageInputPart{}, fmt.Errorf("image content is nil for tool part type %v", toolPart.Type)
-		}
-		return MessageInputPart{
-			Type:  ChatMessagePartTypeImageURL,
-			Image: &MessageInputImage{MessagePartCommon: toolPart.Image.MessagePartCommon},
-			Extra: toolPart.Extra,
-		}, nil
-	case ToolPartTypeAudio:
-		if toolPart.Audio == nil {
-			return MessageInputPart{}, fmt.Errorf("audio content is nil for tool part type %v", toolPart.Type)
-		}
-		return MessageInputPart{
-			Type:  ChatMessagePartTypeAudioURL,
-			Audio: &MessageInputAudio{MessagePartCommon: toolPart.Audio.MessagePartCommon},
-			Extra: toolPart.Extra,
-		}, nil
-	case ToolPartTypeVideo:
-		if toolPart.Video == nil {
-			return MessageInputPart{}, fmt.Errorf("video content is nil for tool part type %v", toolPart.Type)
-		}
-		return MessageInputPart{
-			Type:  ChatMessagePartTypeVideoURL,
-			Video: &MessageInputVideo{MessagePartCommon: toolPart.Video.MessagePartCommon},
-			Extra: toolPart.Extra,
-		}, nil
-	case ToolPartTypeFile:
-		if toolPart.File == nil {
-			return MessageInputPart{}, fmt.Errorf("file content is nil for tool part type %v", toolPart.Type)
-		}
-		return MessageInputPart{
-			Type:  ChatMessagePartTypeFileURL,
-			File:  &MessageInputFile{MessagePartCommon: toolPart.File.MessagePartCommon},
-			Extra: toolPart.Extra,
-		}, nil
-	default:
-		return MessageInputPart{}, fmt.Errorf("unknown tool part type: %v", toolPart.Type)
-	}
-}
-
-// ToMessageInputParts converts ToolOutputPart slice to MessageInputPart slice.
-// This is used when passing tool results as input to the model.
-//
-// Parameters:
-//   - None (method receiver is *ToolResult)
-//
-// Returns:
-//   - []MessageInputPart: The converted message input parts that can be used in a Message.
-//   - error: An error if conversion fails due to unknown part types or nil content fields.
-//
-// Example:
-//
-//	toolResult := &schema.ToolResult{
-//	    Parts: []schema.ToolOutputPart{
-//	        {Type: schema.ToolPartTypeText, Text: "Result text"},
-//	        {Type: schema.ToolPartTypeImage, Image: &schema.ToolOutputImage{...}},
-//	    },
-//	}
-//	inputParts, err := toolResult.ToMessageInputParts()
-func (tr *ToolResult) ToMessageInputParts() ([]MessageInputPart, error) {
-	if tr == nil || len(tr.Parts) == 0 {
-		return nil, nil
-	}
-	result := make([]MessageInputPart, len(tr.Parts))
-	for i, part := range tr.Parts {
-		var err error
-		result[i], err = convToolOutputPartToMessageInputPart(part)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return result, nil
-}
-
 // Deprecated: This struct is deprecated as the MultiContent field is deprecated.
 // For the image input part of the model, use MessageInputImage.
 // For the image output part of the model, use MessageOutputImage.
@@ -489,6 +331,9 @@ const (
 	ChatMessagePartTypeFileURL ChatMessagePartType = "file_url"
 	// ChatMessagePartTypeReasoning means the part is a reasoning block.
 	ChatMessagePartTypeReasoning ChatMessagePartType = "reasoning"
+
+	// ChatMessagePartTypeToolSearchResult means the part contains tool search results.
+	ChatMessagePartTypeToolSearchResult ChatMessagePartType = "tool_search_result"
 )
 
 // Deprecated: This struct is deprecated as the MultiContent field is deprecated.
@@ -748,7 +593,7 @@ var _ MessagesTemplate = MessagesPlaceholder("", false)
 // e.g.
 //
 //	chatTemplate := prompt.FromMessages(
-//		schema.SystemMessage("you are eino helper"),
+//		schema.SystemMessage("you are an eino helper"),
 //		schema.MessagesPlaceholder("history", false), // <= this will use the value of "history" in params
 //	)
 //	msgs, err := chatTemplate.Format(ctx, params)
@@ -766,7 +611,7 @@ type messagesPlaceholder struct {
 //
 //	placeholder := MessagesPlaceholder("history", false)
 //	params := map[string]any{
-//		"history": []*schema.Message{{Role: "user", Content: "what is eino?"}, {Role: "assistant", Content: "eino is a great freamwork to build llm apps"}},
+//		"history": []*schema.Message{{Role: "user", Content: "what is eino?"}, {Role: "assistant", Content: "eino is a great framework to build llm apps"}},
 //		"query": "how to use eino?",
 //	}
 //	chatTemplate := chatTpl := prompt.FromMessages(
@@ -1372,6 +1217,7 @@ func ConcatToolResults(chunks []*ToolResult) (*ToolResult, error) {
 
 		for _, part := range chunk.Parts {
 			if part.Type != ToolPartTypeText {
+				// This restricts non-text modal content only appear once.
 				if prevChunkIdx, exists := nonTextPartTypes[part.Type]; exists {
 					return nil, fmt.Errorf("conflicting %s parts found in chunk %d and chunk %d: "+
 						"non-text modality parts cannot appear in multiple chunks", part.Type, prevChunkIdx, chunkIdx)
@@ -1380,18 +1226,15 @@ func ConcatToolResults(chunks []*ToolResult) (*ToolResult, error) {
 			}
 		}
 
-		mergedChunkParts, err := concatToolOutputParts(chunk.Parts)
-		if err != nil {
-			return nil, fmt.Errorf("failed to merge text parts in chunk %d: %w", chunkIdx, err)
-		}
-		allParts = append(allParts, mergedChunkParts...)
+		allParts = append(allParts, chunk.Parts...)
 	}
 
-	if len(allParts) == 0 {
-		return &ToolResult{}, nil
+	mergedChunkParts, err := concatToolOutputParts(allParts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to merge parts: %w", err)
 	}
 
-	return &ToolResult{Parts: allParts}, nil
+	return &ToolResult{Parts: mergedChunkParts}, nil
 }
 
 func concatToolOutputParts(parts []ToolOutputPart) ([]ToolOutputPart, error) {
@@ -1936,6 +1779,10 @@ func ConcatMessages(msgs []*Message) (*Message, error) {
 				if msg.ResponseMeta.Usage.PromptTokenDetails.CachedTokens > ret.ResponseMeta.Usage.PromptTokenDetails.CachedTokens {
 					ret.ResponseMeta.Usage.PromptTokenDetails.CachedTokens = msg.ResponseMeta.Usage.PromptTokenDetails.CachedTokens
 				}
+
+				if msg.ResponseMeta.Usage.CompletionTokensDetails.ReasoningTokens > ret.ResponseMeta.Usage.CompletionTokensDetails.ReasoningTokens {
+					ret.ResponseMeta.Usage.CompletionTokensDetails.ReasoningTokens = msg.ResponseMeta.Usage.CompletionTokensDetails.ReasoningTokens
+				}
 			}
 
 			if msg.ResponseMeta.LogProbs != nil {
@@ -2049,6 +1896,8 @@ const (
 	jinjaExtends = "extends"
 	jinjaImport  = "import"
 	jinjaFrom    = "from"
+	jinjaFile    = "file"
+	jinjaFileSet = "fileset"
 )
 
 func getJinjaEnv() (*gonja.Environment, error) {
@@ -2086,6 +1935,24 @@ func getJinjaEnv() (*gonja.Environment, error) {
 		if jinjaEnv.Statements.Exists(jinjaImport) {
 			err = jinjaEnv.Statements.Replace(jinjaImport, func(parser *parser.Parser, args *parser.Parser) (nodes.Statement, error) {
 				return nil, fmt.Errorf("keyword[import] has been disabled")
+			})
+			if err != nil {
+				envInitErr = fmt.Errorf(formatInitError, err)
+				return
+			}
+		}
+		if jinjaEnv.Filters.Exists(jinjaFile) {
+			err = jinjaEnv.Filters.Replace(jinjaFile, func(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+				return exec.AsValue(fmt.Errorf("keyword[file] has been disabled"))
+			})
+			if err != nil {
+				envInitErr = fmt.Errorf(formatInitError, err)
+				return
+			}
+		}
+		if jinjaEnv.Filters.Exists(jinjaFileSet) {
+			err = jinjaEnv.Filters.Replace(jinjaFileSet, func(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+				return exec.AsValue(fmt.Errorf("keyword[fileset] has been disabled"))
 			})
 			if err != nil {
 				envInitErr = fmt.Errorf(formatInitError, err)

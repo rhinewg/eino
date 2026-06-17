@@ -159,6 +159,9 @@ func TestConcatMessage(t *testing.T) {
 					PromptTokenDetails: PromptTokenDetails{
 						CachedTokens: 15,
 					},
+					CompletionTokensDetails: CompletionTokensDetails{
+						ReasoningTokens: 8,
+					},
 					TotalTokens: 45,
 				},
 			},
@@ -178,6 +181,9 @@ func TestConcatMessage(t *testing.T) {
 						PromptTokenDetails: PromptTokenDetails{
 							CachedTokens: 10,
 						},
+						CompletionTokensDetails: CompletionTokensDetails{
+							ReasoningTokens: 5,
+						},
 						TotalTokens: 30,
 					},
 				},
@@ -196,6 +202,9 @@ func TestConcatMessage(t *testing.T) {
 						PromptTokens:     30,
 						PromptTokenDetails: PromptTokenDetails{
 							CachedTokens: 15,
+						},
+						CompletionTokensDetails: CompletionTokensDetails{
+							ReasoningTokens: 8,
 						},
 						TotalTokens: 45,
 					},
@@ -417,7 +426,7 @@ func TestConcatMessage(t *testing.T) {
 			{
 				Role:    Assistant,
 				Content: "🚀",
-				//ResponseMeta: &ResponseMeta{},
+				// ResponseMeta: &ResponseMeta{},
 			},
 			{
 				Role:         "",
@@ -1406,8 +1415,9 @@ func TestConcatToolResults(t *testing.T) {
 		}
 		result, err := ConcatToolResults(chunks)
 		assert.NoError(t, err)
-		assert.Len(t, result.Parts, 3)
-
+		assert.Len(t, result.Parts, 1)
+		assert.Equal(t, ToolPartTypeText, result.Parts[0].Type)
+		assert.Equal(t, "Hello World!", result.Parts[0].Text)
 	})
 
 	t.Run("multiple_text_parts_merge_with_extra", func(t *testing.T) {
@@ -1749,30 +1759,7 @@ func TestConcatToolResults(t *testing.T) {
 		assert.Contains(t, err.Error(), "conflicting")
 		assert.Contains(t, err.Error(), "file")
 	})
-
-	t.Run("cross_chunk_text_not_merged", func(t *testing.T) {
-		chunks := []*ToolResult{
-			{
-				Parts: []ToolOutputPart{
-					{Type: ToolPartTypeText, Text: "Hello "},
-				},
-			},
-			{
-				Parts: []ToolOutputPart{
-					{Type: ToolPartTypeText, Text: "World"},
-				},
-			},
-		}
-
-		result, err := ConcatToolResults(chunks)
-		assert.NoError(t, err)
-		assert.Len(t, result.Parts, 2)
-		assert.Equal(t, ToolPartTypeText, result.Parts[0].Type)
-		assert.Equal(t, "Hello ", result.Parts[0].Text)
-		assert.Equal(t, ToolPartTypeText, result.Parts[1].Type)
-		assert.Equal(t, "World", result.Parts[1].Text)
-	})
-
+	
 	t.Run("same_chunk_text_merged", func(t *testing.T) {
 		chunks := []*ToolResult{
 			{
@@ -2059,8 +2046,8 @@ func TestMessageString(t *testing.T) {
 func TestConvToolOutputPartToMessageInputPart(t *testing.T) {
 	t.Run("text part", func(t *testing.T) {
 		toolPart := ToolOutputPart{
-			Type: ToolPartTypeText,
-			Text: "test text",
+			Type:  ToolPartTypeText,
+			Text:  "test text",
 			Extra: map[string]any{"key": "value"},
 		}
 		result, err := convToolOutputPartToMessageInputPart(toolPart)

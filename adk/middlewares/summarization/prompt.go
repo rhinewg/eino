@@ -77,7 +77,14 @@ const systemInstruction = `You are a helpful AI assistant tasked with summarizin
 
 const systemInstructionZh = `你是一个负责总结对话的 AI 助手。`
 
-const userSummaryInstruction = `Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions.
+const userSummaryInstruction = `CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
+
+- Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.
+- You already have all the context you need in the conversation above.
+- Tool calls will be REJECTED and will waste your only turn — you will fail the task.
+- Your entire response must be plain text: an <analysis> block followed by a <summary> block.
+
+Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions.
 This summary should be thorough in capturing technical details, code patterns, and architectural decisions that would be essential for continuing development work without losing context.
 
 Before providing your final summary, wrap your analysis in <analysis> tags to organize your thoughts and ensure you've covered all necessary points. In your analysis process:
@@ -91,8 +98,8 @@ Before providing your final summary, wrap your analysis in <analysis> tags to or
      - full code snippets
      - function signatures
      - file edits
-  - Errors that you ran into and how you fixed them
-  - Pay special attention to specific user feedback that you received, especially if the user told you to do something differently.
+   - Errors that you ran into and how you fixed them
+   - Pay special attention to specific user feedback that you received, especially if the user told you to do something differently.
 2. Double-check for technical accuracy and completeness, addressing each required element thoroughly.
 
 Your summary should include the following sections:
@@ -176,10 +183,17 @@ When you are using compact - please focus on test output and code changes. Inclu
 </example>
 
 
-IMPORTANT: Do NOT use any tools. You MUST respond with ONLY the <summary>...</summary> block as your text output.
+REMINDER: Do NOT call any tools. Respond with plain text only — an <analysis> block followed by a <summary> block. Tool calls will be rejected and you will fail the task.
 `
 
-const userSummaryInstructionZh = `你的任务是对目前为止的对话创建一份详细的总结，需要密切关注用户的明确请求和你之前的操作。
+const userSummaryInstructionZh = `关键：仅以文本响应。不要调用任何工具。
+
+- 不要使用 Read、Bash、Grep、Glob、Edit、Write 或任何其他工具。
+- 你已经拥有上述对话中所需的全部上下文。
+- 工具调用将被拒绝，并且会浪费你唯一的一次回复机会——你将无法完成任务。
+- 你的整个回复必须是纯文本：先是一个 <analysis> 代码块，后面紧跟一个 <summary> 代码块。
+
+你的任务是对目前为止的对话创建一份详细的总结，需要密切关注用户的明确请求和你之前的操作。
 这份总结应该全面捕捉技术细节、代码模式和架构决策，以确保继续开发工作时不丢失上下文。
 
 在提供最终总结之前，请将你的分析过程包裹在 <analysis> 标签中，以组织思路并确保涵盖所有必要的要点。在分析过程中：
@@ -228,25 +242,25 @@ const userSummaryInstructionZh = `你的任务是对目前为止的对话创建�
 
 3. 文件和代码部分：
    - [文件名 1]
-      - [为什么这个文件重要的总结]
-      - [对这个文件所做更改的总结（如有）]
+      - [该文件为何重要的总结]
+      - [对该文件所做更改的总结（如有）]
       - [重要代码片段]
    - [文件名 2]
       - [重要代码片段]
    - [...]
 
-4. 错误和修复：
+4. 错误与修复：
     - [错误 1 的详细描述]：
-      - [如何修复该错误]
-      - [用户对该错误的反馈（如有）]
+      - [你如何修复该错误]
+      - [与该错误相关的用户反馈（如有）]
     - [...]
 
 5. 问题解决：
-   [已解决问题和正在进行的故障排除的描述]
+   [对已解决问题和正在进行中的排查工作的描述]
 
 6. 所有用户消息：
 <all_user_messages>
-    - [详细的非工具使用用户消息]
+    - [详细的非工具调用的用户消息]
     - [...]
 </all_user_messages>
 
@@ -278,16 +292,16 @@ const userSummaryInstructionZh = `你的任务是对目前为止的对话创建�
 </example>
 
 
-重要提示：不要使用任何工具。你必须只以 <summary>...</summary> 块作为文本输出进行回复。
+提醒：不要调用任何工具。仅以纯文本响应——一个 <analysis> 代码块后面跟一个 <summary> 代码块。工具调用将被拒绝，你将无法完成任务。
 `
 
 const summaryPreamble = `This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.`
 
 const summaryPreambleZh = `此会话延续自此前一段因上下文耗尽而终止的对话。以下总结概述了此前对话的内容。`
 
-const continueInstruction = `Please continue the conversation from where we left it off without asking the user any further questions. Continue with the last task that you were asked to work on.`
+const continueInstruction = `Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, do not preface with "I'll continue" or similar. Pick up the last task as if the break never happened.`
 
-const continueInstructionZh = `请从我们中断的地方继续对话，无需向用户提出任何进一步的问题。继续完成先前指令中未完成的任务。`
+const continueInstructionZh = `从对话中断的地方继续，不要再问用户任何问题。直接继续——不要提及总结，不要复述之前的经过，不要以"我会继续"之类的话作为开场白。就像中断从未发生过一样，继续上次的任务。`
 
 const transcriptPathInstruction = `If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: %s`
 
@@ -300,3 +314,27 @@ const truncatedMarkerFormatZh = "…已截断 %d 个字符…"
 const userMessagesReplacedNote = "Some earlier user messages have been cleared. Below are the most recent user messages:"
 
 const userMessagesReplacedNoteZh = "部分较早的用户消息已被清除，以下是保留的最近用户消息："
+
+const skillSectionFormat = "### Skill: %s\n\n%s"
+
+const skillPreamble = "The following skills were invoked in this session. Continue to follow these guidelines:\n\n%s"
+
+const skillPreambleZh = "以下 Skill 已在本会话中被调用，请继续遵循这些指导原则：\n\n%s"
+
+func getSkillPreamble() string {
+	return internal.SelectPrompt(internal.I18nPrompts{
+		English: skillPreamble,
+		Chinese: skillPreambleZh,
+	})
+}
+
+const skillTruncationMarker = "\n\n[... skill content truncated for compaction; use Read on the skill path if you need the full text]"
+
+const skillTruncationMarkerZh = "\n\n[... skill 内容已在压缩时截断，如需完整内容请通过 Read 读取 skill 对应的文件路径]"
+
+func getSkillTruncationMarker() string {
+	return internal.SelectPrompt(internal.I18nPrompts{
+		English: skillTruncationMarker,
+		Chinese: skillTruncationMarkerZh,
+	})
+}

@@ -23,6 +23,7 @@ import (
 	"errors"
 	"io"
 
+	"github.com/cloudwego/eino/adk/internal"
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
@@ -31,15 +32,17 @@ import (
 // ErrExceedMaxIterations indicates the agent reached the maximum iterations limit.
 var ErrExceedMaxIterations = errors.New("exceeds max iterations")
 
-// State holds agent runtime state including messages and user-extensible storage.
-//
-// Deprecated: This type will be unexported in v1.0.0. Use ChatModelAgentState
-// in HandlerMiddleware and AgentMiddleware callbacks instead. Direct use of
-// compose.ProcessState[*State] is discouraged and will stop working in v1.0.0;
-// use the handler APIs instead.
-type State struct {
-	Messages []Message
-	extra    map[string]any
+type typedState[M MessageType] struct {
+	Messages []M
+	Extra    map[string]any
+
+	// ToolInfos contains the tool definitions passed to the model via model.WithTools.
+	// Managed by the framework and modifiable by BeforeModelRewriteState handlers.
+	ToolInfos []*schema.ToolInfo
+
+	// DeferredToolInfos contains tool definitions for server-side deferred retrieval,
+	// passed to the model via model.WithDeferredTools. Nil when not in use.
+	DeferredToolInfos []*schema.ToolInfo
 
 	// Internal fields below - do not access directly.
 	// Kept exported for backward compatibility with existing checkpoints.
@@ -48,201 +51,208 @@ type State struct {
 	ToolGenActions           map[string]*AgentAction
 	AgentName                string
 	RemainingIterations      int
-
-	internals map[string]any
+	ReturnDirectlyEvent      *TypedAgentEvent[M]
+	RetryAttempt             int
+	ToolMsgIDs               map[string]map[string]string // toolName → callID → eino message ID
 }
 
+// State is the internal state of the ChatModelAgent.
+//
+// Deprecated: State is exported only for checkpoint backward compatibility.
+// Do not use it directly.
+type State = typedState[*schema.Message]
+
+type agenticState = typedState[*schema.AgenticMessage]
+
 const (
-	stateKeyReturnDirectlyEvent = "_returnDirectlyEvent"
-	stateKeyRetryAttempt        = "_retryAttempt"
+	stateGobNameV07 = "_eino_adk_react_state"
+
+	// stateGobNameV080 is a v0.8.0-v0.8.3-only alias used after byte-patching
+	// raw checkpoint bytes in preprocessADKCheckpoint.
+	// It must stay the same byte length as stateGobNameV07 so the length-prefixed
+	// gob string in the stream remains valid.
+	stateGobNameV080 = "_eino_adk_state_v080_"
 )
 
 func init() {
+	// Checkpoint compatibility notes:
+	// - ADK/compose checkpoints are gob-encoded and may store state behind `any`, so gob relies on
+	//   an on-wire type name to choose a local Go type.
+	// - Gob allows only one local Go type per name, and it treats "struct wire" and "GobEncoder wire"
+	//   as incompatible even if the name matches.
+	//
+	// This file maintains 2 epochs of *State decoding:
+	// - v0.7.* and current: "_eino_adk_react_state" + struct wire → decode into *State directly.
+	//   State's exported fields are a superset of v0.7, so gob handles missing fields gracefully.
+	// - v0.8.0-v0.8.3: "_eino_adk_react_state" + GobEncoder wire → byte-patched to stateGobNameV080,
+	//   decode into stateV080 and migrate.
+	schema.RegisterName[*State](stateGobNameV07)
+	schema.RegisterName[*stateV080](stateGobNameV080)
+
+	schema.RegisterName[*typedState[*schema.AgenticMessage]]("_eino_adk_agentic_state")
+	schema.RegisterName[*TypedAgentEvent[*schema.AgenticMessage]]("_eino_adk_agentic_event")
+
+	// backward compatibility when decoding checkpoints created by v0.8.0 - v0.8.3
 	gob.Register(&AgentEvent{})
-	gob.Register(int(0))
+	gob.Register(0)
+
+	schema.RegisterName[*TypedAgentInput[*schema.AgenticMessage]]("_eino_adk_agentic_agent_input")
+	schema.RegisterName[*typedAgentEventWrapper[*schema.AgenticMessage]]("_eino_adk_agentic_event_wrapper")
+	schema.RegisterName[*[]*typedAgentEventWrapper[*schema.AgenticMessage]]("_eino_adk_agentic_event_wrapper_slice")
+	schema.RegisterName[*reactInput]("_eino_adk_react_input")
+	schema.RegisterName[*agenticReactInput]("_eino_adk_agentic_react_input")
 }
 
-func (s *State) getReturnDirectlyEvent() *AgentEvent {
-	if s.internals == nil {
-		return nil
-	}
-	if v, ok := s.internals[stateKeyReturnDirectlyEvent]; ok {
-		return v.(*AgentEvent)
-	}
-	return nil
+func (s *typedState[M]) getReturnDirectlyEvent() *TypedAgentEvent[M] {
+	return s.ReturnDirectlyEvent
 }
 
-func (s *State) setReturnDirectlyEvent(event *AgentEvent) {
-	if s.internals == nil {
-		s.internals = make(map[string]any)
-	}
-	if event == nil {
-		delete(s.internals, stateKeyReturnDirectlyEvent)
-	} else {
-		s.internals[stateKeyReturnDirectlyEvent] = event
-	}
+func (s *typedState[M]) setReturnDirectlyEvent(event *TypedAgentEvent[M]) {
+	s.ReturnDirectlyEvent = event
 }
 
-func (s *State) getRetryAttempt() int {
-	if s.internals == nil {
-		return 0
-	}
-	if v, ok := s.internals[stateKeyRetryAttempt]; ok {
-		return v.(int)
-	}
-	return 0
+func (s *typedState[M]) getRetryAttempt() int {
+	return s.RetryAttempt
 }
 
-func (s *State) setRetryAttempt(attempt int) {
-	if s.internals == nil {
-		s.internals = make(map[string]any)
-	}
-	s.internals[stateKeyRetryAttempt] = attempt
+func (s *typedState[M]) setRetryAttempt(attempt int) {
+	s.RetryAttempt = attempt
 }
 
-const (
-	stateKeyReturnDirectlyToolCallID = "_returnDirectlyToolCallID"
-	stateKeyToolGenActions           = "_toolGenActions"
-	stateKeyRemainingIterations      = "_remainingIterations"
-)
-
-func (s *State) getReturnDirectlyToolCallID() string {
-	if s.internals == nil {
-		return ""
-	}
-	if v, ok := s.internals[stateKeyReturnDirectlyToolCallID].(string); ok {
-		return v
-	}
-	return ""
+func (s *typedState[M]) getReturnDirectlyToolCallID() string {
+	return s.ReturnDirectlyToolCallID
 }
 
-func (s *State) setReturnDirectlyToolCallID(id string) {
-	if s.internals == nil {
-		s.internals = make(map[string]any)
-	}
-	s.internals[stateKeyReturnDirectlyToolCallID] = id
+func (s *typedState[M]) setReturnDirectlyToolCallID(id string) {
 	s.ReturnDirectlyToolCallID = id
 	s.HasReturnDirectly = id != ""
 }
 
-func (s *State) getToolGenActions() map[string]*AgentAction {
-	if s.internals == nil {
-		return nil
-	}
-	if v, ok := s.internals[stateKeyToolGenActions].(map[string]*AgentAction); ok {
-		return v
-	}
-	return nil
+func (s *typedState[M]) getToolGenActions() map[string]*AgentAction {
+	return s.ToolGenActions
 }
 
-func (s *State) setToolGenAction(key string, action *AgentAction) {
-	if s.internals == nil {
-		s.internals = make(map[string]any)
+func (s *typedState[M]) setToolGenAction(key string, action *AgentAction) {
+	if s.ToolGenActions == nil {
+		s.ToolGenActions = make(map[string]*AgentAction)
 	}
-	actions, ok := s.internals[stateKeyToolGenActions].(map[string]*AgentAction)
-	if !ok || actions == nil {
-		actions = make(map[string]*AgentAction)
-		s.internals[stateKeyToolGenActions] = actions
-	}
-	actions[key] = action
+	s.ToolGenActions[key] = action
 }
 
-func (s *State) popToolGenAction(key string) *AgentAction {
-	if s.internals == nil {
+func (s *typedState[M]) popToolGenAction(key string) *AgentAction {
+	if s.ToolGenActions == nil {
 		return nil
 	}
-	actions, ok := s.internals[stateKeyToolGenActions].(map[string]*AgentAction)
-	if !ok || actions == nil {
-		return nil
-	}
-	action := actions[key]
-	delete(actions, key)
+	action := s.ToolGenActions[key]
+	delete(s.ToolGenActions, key)
 	return action
 }
 
-func (s *State) getRemainingIterations() int {
-	if s.internals == nil {
-		return 0
+func (s *typedState[M]) setToolMsgID(toolName, callID, msgID string) {
+	if s.ToolMsgIDs == nil {
+		s.ToolMsgIDs = make(map[string]map[string]string)
 	}
-	if v, ok := s.internals[stateKeyRemainingIterations].(int); ok {
-		return v
+	byCall := s.ToolMsgIDs[toolName]
+	if byCall == nil {
+		byCall = make(map[string]string)
+		s.ToolMsgIDs[toolName] = byCall
 	}
-	return 0
+	byCall[callID] = msgID
 }
 
-func (s *State) setRemainingIterations(iterations int) {
-	if s.internals == nil {
-		s.internals = make(map[string]any)
+func (s *typedState[M]) popToolMsgID(toolName, callID string) string {
+	if s.ToolMsgIDs == nil {
+		return ""
 	}
-	s.internals[stateKeyRemainingIterations] = iterations
+	byCall := s.ToolMsgIDs[toolName]
+	if byCall == nil {
+		return ""
+	}
+	id := byCall[callID]
+	delete(byCall, callID)
+	if len(byCall) == 0 {
+		delete(s.ToolMsgIDs, toolName)
+	}
+	return id
 }
 
-func (s *State) decrementRemainingIterations() {
-	if s.internals == nil {
-		s.internals = make(map[string]any)
-	}
+func (s *typedState[M]) getRemainingIterations() int {
+	return s.RemainingIterations
+}
+
+func (s *typedState[M]) setRemainingIterations(iterations int) {
+	s.RemainingIterations = iterations
+}
+
+func (s *typedState[M]) decrementRemainingIterations() {
 	current := s.getRemainingIterations()
-	s.internals[stateKeyRemainingIterations] = current - 1
+	s.RemainingIterations = current - 1
 }
 
-type stateSerialization struct {
+// stateV080 handles the v0.8.0-v0.8.3 checkpoint format.
+// In those versions, *State implemented GobEncoder and was registered under
+// "_eino_adk_react_state". GobEncode serialized a stateSerialization struct
+// into opaque bytes. This type's GobDecode reads that format.
+// It is registered under "_eino_adk_state_v080_" — a same-length alias used
+// only after byte-patching the checkpoint data in preprocessADKCheckpoint.
+type stateV080 struct {
 	Messages                 []Message
 	HasReturnDirectly        bool
 	ReturnDirectlyToolCallID string
 	ToolGenActions           map[string]*AgentAction
 	AgentName                string
 	RemainingIterations      int
+	RetryAttempt             int
+	ReturnDirectlyEvent      *AgentEvent
 	Extra                    map[string]any
 	Internals                map[string]any
 }
 
-func (s *State) GobEncode() ([]byte, error) {
-	internals := s.internals
-	if internals == nil {
-		internals = make(map[string]any)
-	}
-	ss := &stateSerialization{
-		Messages:                 s.Messages,
-		HasReturnDirectly:        s.HasReturnDirectly,
-		ReturnDirectlyToolCallID: s.getReturnDirectlyToolCallID(),
-		ToolGenActions:           s.getToolGenActions(),
-		AgentName:                s.AgentName,
-		RemainingIterations:      s.getRemainingIterations(),
-		Extra:                    s.extra,
-		Internals:                internals,
-	}
-	buf := &bytes.Buffer{}
-	if err := gob.NewEncoder(buf).Encode(ss); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
+// stateV080Serialization is the on-wire format that v0.8.0-v0.8.3 GobEncode produced.
+// It is only used by stateV080.GobDecode to parse those legacy opaque bytes.
+type stateV080Serialization stateV080
 
-func (s *State) GobDecode(b []byte) error {
-	ss := &stateSerialization{}
+func (sc *stateV080) GobDecode(b []byte) error {
+	ss := &stateV080Serialization{}
 	if err := gob.NewDecoder(bytes.NewReader(b)).Decode(ss); err != nil {
 		return err
 	}
-	s.Messages = ss.Messages
-	s.extra = ss.Extra
-	s.internals = ss.Internals
-	if s.internals == nil {
-		s.internals = make(map[string]any)
-	}
-
-	s.AgentName = ss.AgentName
-	s.HasReturnDirectly = ss.HasReturnDirectly
-
-	if ss.ReturnDirectlyToolCallID != "" {
-		s.setReturnDirectlyToolCallID(ss.ReturnDirectlyToolCallID)
-	}
-	if ss.ToolGenActions != nil {
-		s.internals[stateKeyToolGenActions] = ss.ToolGenActions
-	}
-	if ss.RemainingIterations != 0 {
-		s.setRemainingIterations(ss.RemainingIterations)
-	}
+	sc.Messages = ss.Messages
+	sc.HasReturnDirectly = ss.HasReturnDirectly
+	sc.ReturnDirectlyToolCallID = ss.ReturnDirectlyToolCallID
+	sc.ToolGenActions = ss.ToolGenActions
+	sc.AgentName = ss.AgentName
+	sc.RemainingIterations = ss.RemainingIterations
+	sc.Extra = ss.Extra
+	sc.Internals = ss.Internals
 	return nil
+}
+
+// stateV080ToState converts a legacy *stateV080 (v0.8.0-v0.8.3) to a current *State.
+func stateV080ToState(sc *stateV080) *State {
+	s := &State{
+		Messages:                 sc.Messages,
+		HasReturnDirectly:        sc.HasReturnDirectly,
+		ReturnDirectlyToolCallID: sc.ReturnDirectlyToolCallID,
+		ToolGenActions:           sc.ToolGenActions,
+		AgentName:                sc.AgentName,
+		RemainingIterations:      sc.RemainingIterations,
+		Extra:                    sc.Extra,
+	}
+	if sc.ReturnDirectlyToolCallID != "" {
+		s.setReturnDirectlyToolCallID(sc.ReturnDirectlyToolCallID)
+	}
+	if sc.Internals != nil && s.RetryAttempt == 0 {
+		if v, ok := sc.Internals["_retryAttempt"].(int); ok {
+			s.RetryAttempt = v
+		}
+	}
+	if sc.Internals != nil && s.ReturnDirectlyEvent == nil {
+		if v, ok := sc.Internals["_returnDirectlyEvent"].(*AgentEvent); ok {
+			s.ReturnDirectlyEvent = v
+		}
+	}
+	return s
 }
 
 // SendToolGenAction attaches an AgentAction to the next tool event emitted for the
@@ -275,23 +285,29 @@ func SendToolGenAction(ctx context.Context, toolName string, action *AgentAction
 }
 
 type reactInput struct {
-	messages []Message
+	Messages []Message
 }
 
-type reactConfig struct {
-	// model is the chat model used by the react graph.
-	// Tools are configured via model.WithTools call option, not the WithTools method.
-	model model.BaseChatModel
+type typedReactConfig[M MessageType] struct {
+	model model.BaseModel[M]
 
 	toolsConfig      *compose.ToolsNodeConfig
-	modelWrapperConf *modelWrapperConfig
+	modelWrapperConf *typedModelWrapperConfig[M]
 
 	toolsReturnDirectly map[string]bool
 
 	agentName string
 
 	maxIterations int
+
+	cancelCtx *cancelContext
+
+	// afterAgentFunc is called when the agent reaches a successful terminal state.
+	// It runs as a graph node, so compose.ProcessState is available.
+	afterAgentFunc func(ctx context.Context, msg M) (M, error)
 }
+
+type reactConfig = typedReactConfig[*schema.Message]
 
 func genToolInfos(ctx context.Context, config *compose.ToolsNodeConfig) ([]*schema.ToolInfo, error) {
 	toolInfos := make([]*schema.ToolInfo, 0, len(config.Tools))
@@ -308,8 +324,6 @@ func genToolInfos(ctx context.Context, config *compose.ToolsNodeConfig) ([]*sche
 }
 
 type reactGraph = *compose.Graph[*reactInput, Message]
-type sToolNodeOutput = *schema.StreamReader[[]Message]
-type sGraphOutput = MessageStream
 
 func getReturnDirectlyToolCallID(ctx context.Context) (string, bool) {
 	var toolCallID string
@@ -339,46 +353,68 @@ func genReactState(config *reactConfig) func(ctx context.Context) *State {
 
 func newReact(ctx context.Context, config *reactConfig) (reactGraph, error) {
 	const (
-		initNode_  = "Init"
-		chatModel_ = "ChatModel"
-		toolNode_  = "ToolNode"
+		initNode_                      = "Init"
+		chatModel_                     = "ChatModel"
+		cancelCheckNode_               = "CancelCheck"
+		toolNode_                      = "ToolNode"
+		afterToolCallsNode_            = "AfterToolCalls"
+		afterToolCallsCancelCheckNode_ = "AfterToolCallsCancelCheck"
+		afterAgentNode_                = "AfterAgent"
 	)
 
+	cancelCtx := config.cancelCtx
 	g := compose.NewGraph[*reactInput, Message](compose.WithGenLocalState(genReactState(config)))
+	_ = g.AddLambdaNode(initNode_, compose.InvokableLambda(func(ctx context.Context, input *reactInput) ([]Message, error) {
+		_ = compose.ProcessState(ctx, func(_ context.Context, st *State) error {
+			st.Messages = append(st.Messages, input.Messages...)
+			return nil
+		})
+		return input.Messages, nil
+	}), compose.WithNodeName(initNode_))
 
-	initLambda := func(ctx context.Context, input *reactInput) ([]Message, error) {
-		return input.messages, nil
-	}
-	_ = g.AddLambdaNode(initNode_, compose.InvokableLambda(initLambda), compose.WithNodeName(initNode_))
-
-	var wrappedModel model.BaseChatModel = config.model
+	var wrappedModel = config.model
 	if config.modelWrapperConf != nil {
 		wrappedModel = buildModelWrappers(config.model, config.modelWrapperConf)
 	}
 
-	toolsNode, err := compose.NewToolNode(ctx, config.toolsConfig)
+	toolsConfig := config.toolsConfig
+
+	toolsNode, err := compose.NewToolNode(ctx, toolsConfig)
 	if err != nil {
 		return nil, err
 	}
 
-	modelPreHandle := func(ctx context.Context, input []Message, st *State) ([]Message, error) {
-		if st.getRemainingIterations() <= 0 {
-			return nil, ErrExceedMaxIterations
+	_ = g.AddChatModelNode(chatModel_, wrappedModel, compose.WithStatePreHandler(
+		func(ctx context.Context, input []Message, st *State) ([]Message, error) {
+			if st.getRemainingIterations() <= 0 {
+				return nil, ErrExceedMaxIterations
+			}
+			st.decrementRemainingIterations()
+			return input, nil
+		}), compose.WithNodeName(chatModel_))
+
+	// CancelAfterChatModel safe-point: on the tool-calls path, after the branch
+	// has confirmed that the model response contains tool calls (i.e. not a final
+	// answer). Skipped entirely when the model produces a final answer.
+	_ = g.AddLambdaNode(cancelCheckNode_, compose.InvokableLambda(func(ctx context.Context, msg Message) (Message, error) {
+		if cancelCtx != nil && cancelCtx.shouldCancel() {
+			if cancelCtx.getMode()&CancelAfterChatModel != 0 {
+				return nil, compose.StatefulInterrupt(ctx, "CancelAfterChatModel", msg)
+			}
 		}
-		st.decrementRemainingIterations()
-		return input, nil
-	}
-	_ = g.AddChatModelNode(chatModel_, wrappedModel,
-		compose.WithStatePreHandler(modelPreHandle), compose.WithNodeName(chatModel_))
+		wasInterrupted, hasState, state := compose.GetInterruptState[Message](ctx)
+		if wasInterrupted && hasState {
+			msg = state
+		}
+		return msg, nil
+	}), compose.WithNodeName(cancelCheckNode_))
 
 	toolPreHandle := func(ctx context.Context, _ Message, st *State) (Message, error) {
 		input := st.Messages[len(st.Messages)-1]
-
 		returnDirectly := config.toolsReturnDirectly
-		if execCtx := getChatModelAgentExecCtx(ctx); execCtx != nil && len(execCtx.runtimeReturnDirectly) > 0 {
+		if execCtx := getTypedChatModelAgentExecCtx[*schema.Message](ctx); execCtx != nil && len(execCtx.runtimeReturnDirectly) > 0 {
 			returnDirectly = execCtx.runtimeReturnDirectly
 		}
-
 		if len(returnDirectly) > 0 {
 			for i := range input.ToolCalls {
 				toolName := input.ToolCalls[i].Function.Name
@@ -387,25 +423,75 @@ func newReact(ctx context.Context, config *reactConfig) (reactGraph, error) {
 				}
 			}
 		}
-
 		return input, nil
 	}
-
 	toolPostHandle := func(ctx context.Context, out *schema.StreamReader[[]*schema.Message], st *State) (*schema.StreamReader[[]*schema.Message], error) {
 		if event := st.getReturnDirectlyEvent(); event != nil {
-			getChatModelAgentExecCtx(ctx).send(event)
+			getTypedChatModelAgentExecCtx[*schema.Message](ctx).send(event)
 			st.setReturnDirectlyEvent(nil)
 		}
 		return out, nil
 	}
-
 	_ = g.AddToolsNode(toolNode_, toolsNode,
 		compose.WithStatePreHandler(toolPreHandle),
 		compose.WithStreamStatePostHandler(toolPostHandle),
 		compose.WithNodeName(toolNode_))
 
+	// AfterToolCalls node: persists tool results to state and fires the after-tool-calls hook.
+	// The graph auto-materializes the ToolsNode stream into []Message before this node.
+	afterToolCalls := func(ctx context.Context, toolResults []Message) ([]Message, error) {
+		// Propagate tool message IDs from event sender to state messages.
+		// The event sender pre-generated IDs and stored them in state.ToolMsgIDs[toolName+callID].
+		// Here we pop them and set them on the compose-created tool result messages
+		// so that state messages share the same IDs as their corresponding event messages.
+		// If no stored ID is found (old checkpoint, custom event sender), generate a fresh one.
+		_ = compose.ProcessState(ctx, func(_ context.Context, st *State) error {
+			for _, msg := range toolResults {
+				if id := st.popToolMsgID(msg.ToolName, msg.ToolCallID); id != "" {
+					msg.Extra = internal.SetMessageID(msg.Extra, id)
+				} else {
+					msg.Extra = internal.EnsureMessageID(msg.Extra)
+				}
+				st.Messages = append(st.Messages, msg)
+			}
+			return nil
+		})
+
+		execCtx := getTypedChatModelAgentExecCtx[Message](ctx)
+		if execCtx != nil && execCtx.afterToolCallsHook != nil {
+			if err := execCtx.afterToolCallsHook(ctx); err != nil {
+				return nil, err
+			}
+		}
+
+		return toolResults, nil
+	}
+	_ = g.AddLambdaNode(afterToolCallsNode_, compose.InvokableLambda(afterToolCalls),
+		compose.WithNodeName(afterToolCallsNode_))
+
+	// AfterToolCallsCancelCheck: CancelAfterToolCalls safe-point, separated from toolPostHandle.
+	afterToolCallsCancelCheck := func(ctx context.Context, toolResults []Message) ([]Message, error) {
+		if cancelCtx != nil && cancelCtx.shouldCancel() {
+			if cancelCtx.getMode()&CancelAfterToolCalls != 0 {
+				return nil, compose.Interrupt(ctx, "CancelAfterToolCalls")
+			}
+		}
+		return toolResults, nil
+	}
+	_ = g.AddLambdaNode(afterToolCallsCancelCheckNode_, compose.InvokableLambda(afterToolCallsCancelCheck),
+		compose.WithNodeName(afterToolCallsCancelCheckNode_))
+
 	_ = g.AddEdge(compose.START, initNode_)
 	_ = g.AddEdge(initNode_, chatModel_)
+
+	// Determine the terminal node: afterAgentNode_ if afterAgentFunc is set, otherwise compose.END.
+	terminalNode := compose.END
+	if config.afterAgentFunc != nil {
+		_ = g.AddLambdaNode(afterAgentNode_, compose.InvokableLambda(config.afterAgentFunc),
+			compose.WithNodeName(afterAgentNode_))
+		_ = g.AddEdge(afterAgentNode_, compose.END)
+		terminalNode = afterAgentNode_
+	}
 
 	toolCallCheck := func(ctx context.Context, sMsg MessageStream) (string, error) {
 		defer sMsg.Close()
@@ -413,48 +499,46 @@ func newReact(ctx context.Context, config *reactConfig) (reactGraph, error) {
 			chunk, err_ := sMsg.Recv()
 			if err_ != nil {
 				if err_ == io.EOF {
-					return compose.END, nil
+					return terminalNode, nil
 				}
 
 				return "", err_
 			}
 
 			if len(chunk.ToolCalls) > 0 {
-				return toolNode_, nil
+				return cancelCheckNode_, nil
 			}
 		}
 	}
-	branch := compose.NewStreamGraphBranch(toolCallCheck, map[string]bool{compose.END: true, toolNode_: true})
+	branch := compose.NewStreamGraphBranch(toolCallCheck, map[string]bool{terminalNode: true, cancelCheckNode_: true})
 	_ = g.AddBranch(chatModel_, branch)
+
+	_ = g.AddEdge(cancelCheckNode_, toolNode_)
+	_ = g.AddEdge(toolNode_, afterToolCallsNode_)
+	_ = g.AddEdge(afterToolCallsNode_, afterToolCallsCancelCheckNode_)
 
 	if len(config.toolsReturnDirectly) > 0 {
 		const (
 			toolNodeToEndConverter = "ToolNodeToEndConverter"
 		)
 
-		cvt := func(ctx context.Context, sToolCallMessages sToolNodeOutput) (sGraphOutput, error) {
+		cvt := func(ctx context.Context, toolResults []Message) (Message, error) {
 			id, _ := getReturnDirectlyToolCallID(ctx)
 
-			return schema.StreamReaderWithConvert(sToolCallMessages,
-				func(in []Message) (Message, error) {
+			for _, msg := range toolResults {
+				if msg != nil && msg.ToolCallID == id {
+					return msg, nil
+				}
+			}
 
-					for _, chunk := range in {
-						if chunk != nil && chunk.ToolCallID == id {
-							return chunk, nil
-						}
-					}
-
-					return nil, schema.ErrNoValue
-				}), nil
+			return nil, errors.New("return directly tool call result not found")
 		}
 
-		_ = g.AddLambdaNode(toolNodeToEndConverter, compose.TransformableLambda(cvt),
+		_ = g.AddLambdaNode(toolNodeToEndConverter, compose.InvokableLambda(cvt),
 			compose.WithNodeName(toolNodeToEndConverter))
-		_ = g.AddEdge(toolNodeToEndConverter, compose.END)
+		_ = g.AddEdge(toolNodeToEndConverter, terminalNode)
 
-		checkReturnDirect := func(ctx context.Context,
-			sToolCallMessages sToolNodeOutput) (string, error) {
-
+		checkReturnDirect := func(ctx context.Context, toolResults []Message) (string, error) {
 			_, ok := getReturnDirectlyToolCallID(ctx)
 
 			if ok {
@@ -464,12 +548,276 @@ func newReact(ctx context.Context, config *reactConfig) (reactGraph, error) {
 			return chatModel_, nil
 		}
 
-		branch = compose.NewStreamGraphBranch(checkReturnDirect,
+		returnDirectBranch := compose.NewGraphBranch(checkReturnDirect,
 			map[string]bool{toolNodeToEndConverter: true, chatModel_: true})
-		_ = g.AddBranch(toolNode_, branch)
+		_ = g.AddBranch(afterToolCallsCancelCheckNode_, returnDirectBranch)
 	} else {
-		_ = g.AddEdge(toolNode_, chatModel_)
+		_ = g.AddEdge(afterToolCallsCancelCheckNode_, chatModel_)
 	}
 
 	return g, nil
+}
+
+type agenticReactInput struct {
+	Messages []*schema.AgenticMessage
+}
+
+type agenticReactConfig = typedReactConfig[*schema.AgenticMessage]
+
+type agenticReactGraph = *compose.Graph[*agenticReactInput, *schema.AgenticMessage]
+
+func getAgenticReturnDirectlyToolCallID(ctx context.Context) (string, bool) {
+	var toolCallID string
+	_ = compose.ProcessState(ctx, func(_ context.Context, st *agenticState) error {
+		toolCallID = st.getReturnDirectlyToolCallID()
+		return nil
+	})
+	return toolCallID, toolCallID != ""
+}
+
+func genAgenticReactState(config *agenticReactConfig) func(ctx context.Context) *agenticState {
+	return func(ctx context.Context) *agenticState {
+		st := &agenticState{
+			AgentName: config.agentName,
+		}
+		maxIter := 20
+		if config.maxIterations > 0 {
+			maxIter = config.maxIterations
+		}
+		st.setRemainingIterations(maxIter)
+		return st
+	}
+}
+
+func agenticMessageHasToolCalls(msg *schema.AgenticMessage) bool {
+	if msg == nil {
+		return false
+	}
+	for _, block := range msg.ContentBlocks {
+		if block != nil && block.Type == schema.ContentBlockTypeFunctionToolCall && block.FunctionToolCall != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func newAgenticReact(ctx context.Context, config *agenticReactConfig) (agenticReactGraph, error) {
+	const (
+		initNode_                      = "Init"
+		chatModel_                     = "ChatModel"
+		cancelCheckNode_               = "CancelCheck"
+		toolNode_                      = "ToolNode"
+		afterToolCallsNode_            = "AfterToolCalls"
+		afterToolCallsCancelCheckNode_ = "AfterToolCallsCancelCheck"
+		afterAgentNode_                = "AfterAgent"
+	)
+
+	cancelCtx := config.cancelCtx
+	g := compose.NewGraph[*agenticReactInput, *schema.AgenticMessage](
+		compose.WithGenLocalState(genAgenticReactState(config)))
+	_ = g.AddLambdaNode(initNode_, compose.InvokableLambda(func(ctx context.Context, input *agenticReactInput) ([]*schema.AgenticMessage, error) {
+		_ = compose.ProcessState(ctx, func(_ context.Context, st *agenticState) error {
+			st.Messages = append(st.Messages, input.Messages...)
+			return nil
+		})
+		return input.Messages, nil
+	}), compose.WithNodeName(initNode_))
+
+	var wrappedModel = config.model
+	if config.modelWrapperConf != nil {
+		wrappedModel = buildModelWrappers(config.model, config.modelWrapperConf)
+	}
+
+	toolsNode, err := compose.NewAgenticToolsNode(ctx, config.toolsConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	_ = g.AddAgenticModelNode(chatModel_, wrappedModel, compose.WithStatePreHandler(
+		func(ctx context.Context, input []*schema.AgenticMessage, st *agenticState) ([]*schema.AgenticMessage, error) {
+			if st.getRemainingIterations() <= 0 {
+				return nil, ErrExceedMaxIterations
+			}
+			st.decrementRemainingIterations()
+			return input, nil
+		}), compose.WithNodeName(chatModel_))
+
+	_ = g.AddLambdaNode(cancelCheckNode_, compose.InvokableLambda(func(ctx context.Context, msg *schema.AgenticMessage) (*schema.AgenticMessage, error) {
+		if cancelCtx != nil && cancelCtx.shouldCancel() {
+			if cancelCtx.getMode()&CancelAfterChatModel != 0 {
+				return nil, compose.StatefulInterrupt(ctx, "CancelAfterChatModel", msg)
+			}
+		}
+		wasInterrupted, hasState, state := compose.GetInterruptState[*schema.AgenticMessage](ctx)
+		if wasInterrupted && hasState {
+			msg = state
+		}
+		return msg, nil
+	}), compose.WithNodeName(cancelCheckNode_))
+
+	toolPreHandle := func(ctx context.Context, _ *schema.AgenticMessage, st *agenticState) (*schema.AgenticMessage, error) {
+		input := st.Messages[len(st.Messages)-1]
+		returnDirectly := config.toolsReturnDirectly
+		if execCtx := getTypedChatModelAgentExecCtx[*schema.AgenticMessage](ctx); execCtx != nil && len(execCtx.runtimeReturnDirectly) > 0 {
+			returnDirectly = execCtx.runtimeReturnDirectly
+		}
+		if len(returnDirectly) > 0 {
+			for _, block := range input.ContentBlocks {
+				if block == nil || block.Type != schema.ContentBlockTypeFunctionToolCall || block.FunctionToolCall == nil {
+					continue
+				}
+				if _, ok := returnDirectly[block.FunctionToolCall.Name]; ok {
+					st.setReturnDirectlyToolCallID(block.FunctionToolCall.CallID)
+				}
+			}
+		}
+		return input, nil
+	}
+	toolPostHandle := func(ctx context.Context, out *schema.StreamReader[[]*schema.AgenticMessage], st *agenticState) (*schema.StreamReader[[]*schema.AgenticMessage], error) {
+		if event := st.getReturnDirectlyEvent(); event != nil {
+			getTypedChatModelAgentExecCtx[*schema.AgenticMessage](ctx).send(event)
+			st.setReturnDirectlyEvent(nil)
+		}
+		return out, nil
+	}
+	_ = g.AddAgenticToolsNode(toolNode_, toolsNode,
+		compose.WithStatePreHandler(toolPreHandle),
+		compose.WithStreamStatePostHandler(toolPostHandle),
+		compose.WithNodeName(toolNode_))
+
+	afterToolCalls := func(ctx context.Context, toolResults []*schema.AgenticMessage) ([]*schema.AgenticMessage, error) {
+		_ = compose.ProcessState(ctx, func(_ context.Context, st *agenticState) error {
+			for _, msg := range toolResults {
+				if msg == nil {
+					continue
+				}
+				toolName, callID := extractToolIdentifiers(msg)
+				if id := st.popToolMsgID(toolName, callID); id != "" {
+					msg.Extra = internal.SetMessageID(msg.Extra, id)
+				} else {
+					msg.Extra = internal.EnsureMessageID(msg.Extra)
+				}
+				st.Messages = append(st.Messages, msg)
+			}
+			return nil
+		})
+
+		execCtx := getTypedChatModelAgentExecCtx[*schema.AgenticMessage](ctx)
+		if execCtx != nil && execCtx.afterToolCallsHook != nil {
+			if err := execCtx.afterToolCallsHook(ctx); err != nil {
+				return nil, err
+			}
+		}
+
+		return toolResults, nil
+	}
+	_ = g.AddLambdaNode(afterToolCallsNode_, compose.InvokableLambda(afterToolCalls),
+		compose.WithNodeName(afterToolCallsNode_))
+
+	afterToolCallsCancelCheck := func(ctx context.Context, toolResults []*schema.AgenticMessage) ([]*schema.AgenticMessage, error) {
+		if cancelCtx != nil && cancelCtx.shouldCancel() {
+			if cancelCtx.getMode()&CancelAfterToolCalls != 0 {
+				return nil, compose.Interrupt(ctx, "CancelAfterToolCalls")
+			}
+		}
+		return toolResults, nil
+	}
+	_ = g.AddLambdaNode(afterToolCallsCancelCheckNode_, compose.InvokableLambda(afterToolCallsCancelCheck),
+		compose.WithNodeName(afterToolCallsCancelCheckNode_))
+
+	_ = g.AddEdge(compose.START, initNode_)
+	_ = g.AddEdge(initNode_, chatModel_)
+
+	// Determine the terminal node: afterAgentNode_ if afterAgentFunc is set, otherwise compose.END.
+	terminalNode := compose.END
+	if config.afterAgentFunc != nil {
+		_ = g.AddLambdaNode(afterAgentNode_, compose.InvokableLambda(config.afterAgentFunc),
+			compose.WithNodeName(afterAgentNode_))
+		_ = g.AddEdge(afterAgentNode_, compose.END)
+		terminalNode = afterAgentNode_
+	}
+
+	toolCallCheck := func(ctx context.Context, sMsg *schema.StreamReader[*schema.AgenticMessage]) (string, error) {
+		defer sMsg.Close()
+		for {
+			chunk, err_ := sMsg.Recv()
+			if err_ != nil {
+				if err_ == io.EOF {
+					return terminalNode, nil
+				}
+				return "", err_
+			}
+			if agenticMessageHasToolCalls(chunk) {
+				return cancelCheckNode_, nil
+			}
+		}
+	}
+	branch := compose.NewStreamGraphBranch(toolCallCheck, map[string]bool{terminalNode: true, cancelCheckNode_: true})
+	_ = g.AddBranch(chatModel_, branch)
+
+	_ = g.AddEdge(cancelCheckNode_, toolNode_)
+	_ = g.AddEdge(toolNode_, afterToolCallsNode_)
+	_ = g.AddEdge(afterToolCallsNode_, afterToolCallsCancelCheckNode_)
+
+	if len(config.toolsReturnDirectly) > 0 {
+		const (
+			toolNodeToEndConverter = "ToolNodeToEndConverter"
+		)
+
+		cvt := func(ctx context.Context, toolResults []*schema.AgenticMessage) (*schema.AgenticMessage, error) {
+			id, _ := getAgenticReturnDirectlyToolCallID(ctx)
+			for _, msg := range toolResults {
+				if msg == nil {
+					continue
+				}
+				_, callID := extractToolIdentifiers(msg)
+				if callID == id {
+					return msg, nil
+				}
+			}
+			return nil, errors.New("return directly tool call result not found")
+		}
+
+		_ = g.AddLambdaNode(toolNodeToEndConverter, compose.InvokableLambda(cvt),
+			compose.WithNodeName(toolNodeToEndConverter))
+		_ = g.AddEdge(toolNodeToEndConverter, terminalNode)
+
+		checkReturnDirect := func(ctx context.Context, toolResults []*schema.AgenticMessage) (string, error) {
+			_, ok := getAgenticReturnDirectlyToolCallID(ctx)
+			if ok {
+				return toolNodeToEndConverter, nil
+			}
+			return chatModel_, nil
+		}
+
+		returnDirectBranch := compose.NewGraphBranch(checkReturnDirect,
+			map[string]bool{toolNodeToEndConverter: true, chatModel_: true})
+		_ = g.AddBranch(afterToolCallsCancelCheckNode_, returnDirectBranch)
+	} else {
+		_ = g.AddEdge(afterToolCallsCancelCheckNode_, chatModel_)
+	}
+
+	return g, nil
+}
+
+// extractToolIdentifiers extracts the tool name and call ID from an AgenticMessage
+// that contains a tool result content block.
+// Assumes one tool result per message, which is guaranteed by AgenticToolsNode
+// (see compose.toolMessageToAgenticMessage).
+func extractToolIdentifiers(msg *schema.AgenticMessage) (toolName, callID string) {
+	if msg == nil {
+		return "", ""
+	}
+	for _, block := range msg.ContentBlocks {
+		if block == nil {
+			continue
+		}
+		if block.Type == schema.ContentBlockTypeFunctionToolResult && block.FunctionToolResult != nil {
+			return block.FunctionToolResult.Name, block.FunctionToolResult.CallID
+		}
+		if block.Type == schema.ContentBlockTypeToolSearchResult && block.ToolSearchFunctionToolResult != nil {
+			return block.ToolSearchFunctionToolResult.Name, block.ToolSearchFunctionToolResult.CallID
+		}
+	}
+	return "", ""
 }

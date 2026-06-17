@@ -29,6 +29,17 @@ type CheckPointStore interface {
 	Set(ctx context.Context, checkPointID string, checkPoint []byte) error
 }
 
+// CheckPointDeleter is an optional interface that CheckPointStore implementations
+// can implement to support explicit checkpoint deletion.
+//
+// If the Store does not implement this interface, stale checkpoints will NOT be
+// automatically cleaned up. The store owner is responsible for managing checkpoint
+// lifecycle in that case (e.g., via TTL, external cleanup, or implementing this
+// interface).
+type CheckPointDeleter interface {
+	Delete(ctx context.Context, checkPointID string) error
+}
+
 type InterruptSignal struct {
 	ID string
 	Address

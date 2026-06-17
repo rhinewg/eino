@@ -19,6 +19,10 @@ package toolsearch
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"sort"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -27,464 +31,1012 @@ import (
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
+	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
 )
 
-type mockTool struct {
-	name string
-	desc string
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+func makeToolMap(tools ...*schema.ToolInfo) map[string]*schema.ToolInfo {
+	m := make(map[string]*schema.ToolInfo, len(tools))
+	for _, t := range tools {
+		m[t.Name] = t
+	}
+	return m
 }
 
-func (m *mockTool) Info(ctx context.Context) (*schema.ToolInfo, error) {
+func ti(name, desc string) *schema.ToolInfo {
+	return &schema.ToolInfo{Name: name, Desc: desc}
+}
+
+func toolNames(infos []*schema.ToolInfo) []string {
+	names := make([]string, len(infos))
+	for i, info := range infos {
+		names[i] = info.Name
+	}
+	sort.Strings(names)
+	return names
+}
+
+func searchJSON(query string, maxResults *int) string {
+	args := toolSearchArgs{Query: query, MaxResults: maxResults}
+	b, _ := json.Marshal(args)
+	return string(b)
+}
+
+func intPtr(v int) *int { return &v }
+
+// ---------------------------------------------------------------------------
+// TestSearch — unit tests for the search() function
+// ---------------------------------------------------------------------------
+
+func TestSearch(t *testing.T) {
+	tools := makeToolMap(
+		ti("get_weather", "Get current weather for a city"),
+		ti("search_flights", "Search available flights"),
+		ti("mcp__slack__send_message", "Send a message to Slack channel"),
+		ti("mcp__slack__read_channel", "Read messages from Slack channel"),
+		ti("create_calendar_event", "Create a new calendar event"),
+		ti("NotebookEdit", "Edit Jupyter notebook cells"),
+	)
+
+	tests := []struct {
+		name      string
+		json      string
+		wantNames []string // sorted; nil means expect empty
+		wantErr   bool
+	}{
+		{
+			name:      "keyword exact name part match",
+			json:      searchJSON("weather", nil),
+			wantNames: []string{"get_weather"},
+		},
+		{
+			name:      "keyword matches multiple tools",
+			json:      searchJSON("slack", nil),
+			wantNames: []string{"mcp__slack__read_channel", "mcp__slack__send_message"},
+		},
+		{
+			name:      "multi-word ranking - send_message ranked first",
+			json:      searchJSON("send message", nil),
+			wantNames: []string{"mcp__slack__send_message"}, // check first element only
+		},
+		{
+			name:      "required keyword filters to slack only",
+			json:      searchJSON("+slack send", nil),
+			wantNames: []string{"mcp__slack__read_channel", "mcp__slack__send_message"},
+		},
+		{
+			name:      "required keyword no match",
+			json:      searchJSON("+github send", nil),
+			wantNames: nil,
+		},
+		{
+			name:      "direct select single",
+			json:      searchJSON("select:get_weather", nil),
+			wantNames: []string{"get_weather"},
+		},
+		{
+			name:      "direct select multiple",
+			json:      searchJSON("select:get_weather,NotebookEdit", nil),
+			wantNames: []string{"NotebookEdit", "get_weather"},
+		},
+		{
+			name:      "direct select nonexistent",
+			json:      searchJSON("select:nonexistent", nil),
+			wantNames: nil,
+		},
+		{
+			name:      "max_results limits output",
+			json:      searchJSON("slack", intPtr(1)),
+			wantNames: []string{"mcp__slack__read_channel"}, // just check length below
+		},
+		{
+			name:      "camelCase split matches notebook",
+			json:      searchJSON("notebook", nil),
+			wantNames: []string{"NotebookEdit"},
+		},
+		{
+			name:    "empty query returns error",
+			json:    searchJSON("", nil),
+			wantErr: true,
+		},
+		{
+			name:      "description match - jupyter",
+			json:      searchJSON("jupyter", nil),
+			wantNames: []string{"NotebookEdit"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := search(tt.json, tools)
+			if tt.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+
+			// special case: max_results limit
+			if tt.name == "max_results limits output" {
+				assert.Len(t, got, 1)
+				return
+			}
+
+			// special case: ranking — just check first element
+			if tt.name == "multi-word ranking - send_message ranked first" {
+				require.NotEmpty(t, got)
+				assert.Equal(t, "mcp__slack__send_message", got[0].Name)
+				return
+			}
+
+			gotNames := toolNames(got)
+			if tt.wantNames == nil {
+				assert.Empty(t, gotNames)
+			} else {
+				assert.Equal(t, tt.wantNames, gotNames)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestMiddlewareFlow — integration test for UseModelToolSearch=false
+// ---------------------------------------------------------------------------
+
+// simpleTool is a minimal InvokableTool for testing.
+type simpleTool struct {
+	name   string
+	desc   string
+	called bool
+	mu     sync.Mutex
+}
+
+func (s *simpleTool) Info(_ context.Context) (*schema.ToolInfo, error) {
 	return &schema.ToolInfo{
-		Name: m.name,
-		Desc: m.desc,
+		Name: s.name,
+		Desc: s.desc,
+		ParamsOneOf: schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
+			"input": {Type: schema.String, Desc: "input", Required: true},
+		}),
 	}, nil
 }
 
-func newMockTool(name, desc string) *mockTool {
-	return &mockTool{name: name, desc: desc}
+func (s *simpleTool) InvokableRun(_ context.Context, _ string, _ ...tool.Option) (string, error) {
+	s.mu.Lock()
+	s.called = true
+	s.mu.Unlock()
+	return `{"result":"ok"}`, nil
 }
+
+func (s *simpleTool) wasCalled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.called
+}
+
+// mockChatModel implements model.ToolCallingChatModel.
+// It drives a 3-turn conversation:
+//
+//	Turn 1: call tool_search with select:dynamic_tool_a
+//	Turn 2: call dynamic_tool_a
+//	Turn 3: return final text
+type mockChatModel struct {
+	mu           sync.Mutex
+	generateCall int
+	// toolsPerCall records the tool names passed via model.WithTools for each Generate call.
+	toolsPerCall [][]string
+}
+
+func (m *mockChatModel) Generate(_ context.Context, _ []*schema.Message, opts ...model.Option) (*schema.Message, error) {
+	options := model.GetCommonOptions(nil, opts...)
+	var names []string
+	for _, t := range options.Tools {
+		names = append(names, t.Name)
+	}
+	sort.Strings(names)
+
+	m.mu.Lock()
+	m.generateCall++
+	call := m.generateCall
+	m.toolsPerCall = append(m.toolsPerCall, names)
+	m.mu.Unlock()
+
+	switch call {
+	case 1:
+		// Ask tool_search to select dynamic_tool_a
+		return schema.AssistantMessage("", []schema.ToolCall{
+			{
+				ID: "tc1",
+				Function: schema.FunctionCall{
+					Name:      toolSearchToolName,
+					Arguments: `{"query":"select:dynamic_tool_a","max_results":5}`,
+				},
+			},
+		}), nil
+	case 2:
+		// Call dynamic_tool_a
+		return schema.AssistantMessage("", []schema.ToolCall{
+			{
+				ID: "tc2",
+				Function: schema.FunctionCall{
+					Name:      "dynamic_tool_a",
+					Arguments: `{"input":"hello"}`,
+				},
+			},
+		}), nil
+	default:
+		// Final response
+		return schema.AssistantMessage("done", nil), nil
+	}
+}
+
+func (m *mockChatModel) Stream(_ context.Context, _ []*schema.Message, _ ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	return nil, fmt.Errorf("not implemented")
+}
+
+func (m *mockChatModel) WithTools(_ []*schema.ToolInfo) (model.ToolCallingChatModel, error) {
+	return m, nil
+}
+
+func (m *mockChatModel) getToolsPerCall() [][]string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ret := make([][]string, len(m.toolsPerCall))
+	copy(ret, m.toolsPerCall)
+	return ret
+}
+
+func TestMiddlewareFlow(t *testing.T) {
+	ctx := context.Background()
+
+	dynamicA := &simpleTool{name: "dynamic_tool_a", desc: "Dynamic tool A"}
+	dynamicB := &simpleTool{name: "dynamic_tool_b", desc: "Dynamic tool B"}
+	staticTool := &simpleTool{name: "static_tool", desc: "Static tool"}
+
+	mw, err := New(ctx, &Config{
+		DynamicTools:       []tool.BaseTool{dynamicA, dynamicB},
+		UseModelToolSearch: false,
+	})
+	require.NoError(t, err)
+
+	cm := &mockChatModel{}
+
+	agent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+		Name:        "test_agent",
+		Description: "test",
+		Instruction: "you are a test agent",
+		Model:       cm,
+		ToolsConfig: adk.ToolsConfig{
+			ToolsNodeConfig: compose.ToolsNodeConfig{
+				Tools: []tool.BaseTool{staticTool},
+			},
+		},
+		Handlers: []adk.ChatModelAgentMiddleware{mw},
+	})
+	require.NoError(t, err)
+
+	input := &adk.AgentInput{
+		Messages: []adk.Message{schema.UserMessage("test")},
+	}
+	iter := agent.Run(ctx, input)
+
+	var events []*adk.AgentEvent
+	for {
+		ev, ok := iter.Next()
+		if !ok {
+			break
+		}
+		events = append(events, ev)
+	}
+
+	// Verify no error event.
+	for _, ev := range events {
+		if ev.Err != nil {
+			t.Fatalf("unexpected error event: %v", ev.Err)
+		}
+	}
+
+	// Verify final output is "done".
+	lastEvent := events[len(events)-1]
+	require.NotNil(t, lastEvent.Output)
+	require.NotNil(t, lastEvent.Output.MessageOutput)
+	assert.Equal(t, "done", lastEvent.Output.MessageOutput.Message.Content)
+
+	// Verify dynamic_tool_a was actually called.
+	assert.True(t, dynamicA.wasCalled(), "dynamic_tool_a should have been called")
+	assert.False(t, dynamicB.wasCalled(), "dynamic_tool_b should not have been called")
+
+	// Verify tool lists per Generate call.
+	toolsPerCall := cm.getToolsPerCall()
+	require.Len(t, toolsPerCall, 3, "expected 3 Generate calls")
+
+	// Call 1: static_tool visible; dynamic tools are hidden.
+	assert.Contains(t, toolsPerCall[0], "static_tool")
+	assert.NotContains(t, toolsPerCall[0], "dynamic_tool_a")
+	assert.NotContains(t, toolsPerCall[0], "dynamic_tool_b")
+
+	// Call 2: after selecting dynamic_tool_a, it becomes visible.
+	assert.Contains(t, toolsPerCall[1], "static_tool")
+	assert.Contains(t, toolsPerCall[1], "dynamic_tool_a")
+	assert.NotContains(t, toolsPerCall[1], "dynamic_tool_b")
+
+	// Call 3: same as call 2.
+	assert.Contains(t, toolsPerCall[2], "static_tool")
+	assert.Contains(t, toolsPerCall[2], "dynamic_tool_a")
+	assert.NotContains(t, toolsPerCall[2], "dynamic_tool_b")
+
+	// Verify reminder is present in messages (checked via tool list — the wrapper inserts it).
+	// The model received messages, and the reminder contains "<available-deferred-tools>".
+	// We indirectly verify this by checking that the middleware ran without error and the
+	// 3-turn flow completed successfully, which requires the tool_search tool to work.
+
+	// Additional: verify that the reminder contains the dynamic tool names.
+	mwImpl := mw.(*typedMiddleware[*schema.Message])
+	assert.True(t, strings.Contains(mwImpl.sr, "dynamic_tool_a"))
+	assert.True(t, strings.Contains(mwImpl.sr, "dynamic_tool_b"))
+	assert.True(t, strings.Contains(mwImpl.sr, "<available-deferred-tools>"))
+}
+
+// ---------------------------------------------------------------------------
+// TestNew — error paths for New()
+// ---------------------------------------------------------------------------
 
 func TestNew(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("nil config returns error", func(t *testing.T) {
-		m, err := New(ctx, nil)
-		assert.Nil(t, m)
+	t.Run("nil config", func(t *testing.T) {
+		_, err := New(ctx, nil)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "config is required")
 	})
 
-	t.Run("empty tools returns error", func(t *testing.T) {
-		m, err := New(ctx, &Config{DynamicTools: []tool.BaseTool{}})
-		assert.Nil(t, m)
+	t.Run("empty DynamicTools", func(t *testing.T) {
+		_, err := New(ctx, &Config{})
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "tools is required")
 	})
 
-	t.Run("valid config returns middleware", func(t *testing.T) {
-		tools := []tool.BaseTool{
-			newMockTool("tool1", "desc1"),
-			newMockTool("tool2", "desc2"),
-		}
-		m, err := New(ctx, &Config{DynamicTools: tools})
-		assert.NoError(t, err)
-		assert.NotNil(t, m)
+	t.Run("success", func(t *testing.T) {
+		st := &simpleTool{name: "t1", desc: "tool 1"}
+		mw, err := New(ctx, &Config{DynamicTools: []tool.BaseTool{st}})
+		require.NoError(t, err)
+		assert.NotNil(t, mw)
 	})
 }
 
-func TestMiddleware_BeforeAgent(t *testing.T) {
-	ctx := context.Background()
+// ---------------------------------------------------------------------------
+// TestSplitCamelCase
+// ---------------------------------------------------------------------------
 
-	t.Run("nil runCtx returns nil", func(t *testing.T) {
-		tools := []tool.BaseTool{newMockTool("tool1", "desc1")}
-		m, err := New(ctx, &Config{DynamicTools: tools})
-		require.NoError(t, err)
+func TestSplitCamelCase(t *testing.T) {
+	tests := []struct {
+		input string
+		want  []string
+	}{
+		{"", nil},
+		{"hello", []string{"hello"}},
+		{"NotebookEdit", []string{"Notebook", "Edit"}},
+		{"camelCase", []string{"camel", "Case"}},
+		{"HTMLParser", []string{"HTML", "Parser"}},
+		{"getURL", []string{"get", "URL"}},
+		{"A", []string{"A"}},
+		{"AB", []string{"AB"}},
+		{"HTTP", []string{"HTTP"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := splitCamelCase(tt.input)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
 
-		newCtx, newRunCtx, err := m.BeforeAgent(ctx, nil)
-		assert.NoError(t, err)
-		assert.Equal(t, ctx, newCtx)
-		assert.Nil(t, newRunCtx)
+// ---------------------------------------------------------------------------
+// TestEnsureReminder
+// ---------------------------------------------------------------------------
+
+func TestEnsureReminder(t *testing.T) {
+	m := &typedMiddleware[*schema.Message]{sr: "<reminder>"}
+
+	t.Run("normal: system then user", func(t *testing.T) {
+		input := []*schema.Message{
+			{Role: schema.System, Content: "sys"},
+			{Role: schema.User, Content: "hi"},
+		}
+		got := m.ensureReminder(input)
+		require.Len(t, got, 3)
+		assert.Equal(t, schema.System, got[0].Role)
+		assert.Equal(t, schema.User, got[1].Role)
+		assert.Equal(t, "<reminder>", got[1].Content)
+		assert.Equal(t, true, got[1].Extra[toolSearchReminderExtraKey])
+		assert.Equal(t, schema.User, got[2].Role)
+		assert.Equal(t, "hi", got[2].Content)
 	})
 
-	t.Run("adds tool_search and dynamic tools", func(t *testing.T) {
-		tools := []tool.BaseTool{
-			newMockTool("tool1", "desc1"),
-			newMockTool("tool2", "desc2"),
+	t.Run("all system messages", func(t *testing.T) {
+		input := []*schema.Message{
+			{Role: schema.System, Content: "sys1"},
+			{Role: schema.System, Content: "sys2"},
 		}
-		m, err := New(ctx, &Config{DynamicTools: tools})
-		require.NoError(t, err)
+		got := m.ensureReminder(input)
+		require.Len(t, got, 3)
+		assert.Equal(t, schema.System, got[0].Role)
+		assert.Equal(t, schema.System, got[1].Role)
+		assert.Equal(t, "<reminder>", got[2].Content)
+	})
 
-		middleware := m.(*middleware)
-		runCtx := &adk.ChatModelAgentContext{
-			Tools: []tool.BaseTool{},
+	t.Run("empty input", func(t *testing.T) {
+		got := m.ensureReminder(nil)
+		require.Len(t, got, 1)
+		assert.Equal(t, "<reminder>", got[0].Content)
+	})
+
+	t.Run("no system messages", func(t *testing.T) {
+		input := []*schema.Message{
+			{Role: schema.User, Content: "hi"},
+			{Role: schema.Assistant, Content: "hello"},
 		}
+		got := m.ensureReminder(input)
+		require.Len(t, got, 3)
+		assert.Equal(t, "<reminder>", got[0].Content)
+		assert.Equal(t, "hi", got[1].Content)
+		assert.Equal(t, "hello", got[2].Content)
+	})
 
-		_, newRunCtx, err := middleware.BeforeAgent(ctx, runCtx)
-		assert.NoError(t, err)
-		assert.NotNil(t, newRunCtx)
-		assert.Len(t, newRunCtx.Tools, 3)
+	t.Run("idempotent: does not insert twice", func(t *testing.T) {
+		input := []*schema.Message{
+			{Role: schema.User, Content: "<reminder>", Extra: map[string]any{toolSearchReminderExtraKey: true}},
+			{Role: schema.User, Content: "hi"},
+		}
+		got := m.ensureReminder(input)
+		require.Len(t, got, 2)
+		assert.Equal(t, "<reminder>", got[0].Content)
+		assert.Equal(t, "hi", got[1].Content)
 	})
 }
 
-func TestToolSearchTool_Info(t *testing.T) {
-	ctx := context.Background()
-	toolNames := []string{"tool1", "tool2", "tool3"}
-	tst := newToolSearchTool(toolNames)
+// ---------------------------------------------------------------------------
+// TestHelperFunctions
+// ---------------------------------------------------------------------------
 
-	info, err := tst.Info(ctx)
+func TestHelperFunctions(t *testing.T) {
+	t.Run("extractDynamicTools", func(t *testing.T) {
+		m := &typedMiddleware[*schema.Message]{
+			mapOfDynamicTools: map[string]*schema.ToolInfo{
+				"dyn_a": ti("dyn_a", "A"),
+				"dyn_b": ti("dyn_b", "B"),
+			},
+		}
+		tools := []*schema.ToolInfo{ti("static", "S"), ti("dyn_a", "A"), ti("dyn_b", "B")}
+		got := m.extractDynamicTools(tools)
+		assert.Len(t, got, 2)
+		names := toolNames(got)
+		assert.Equal(t, []string{"dyn_a", "dyn_b"}, names)
+	})
+
+	t.Run("stripDynamicTools", func(t *testing.T) {
+		m := &typedMiddleware[*schema.Message]{
+			mapOfDynamicTools: map[string]*schema.ToolInfo{
+				"dyn_a": ti("dyn_a", "A"),
+				"dyn_b": ti("dyn_b", "B"),
+			},
+		}
+		tools := []*schema.ToolInfo{ti("static", "S"), ti("dyn_a", "A"), ti("tool_search", "TS")}
+		got := m.stripDynamicTools(tools)
+		names := toolNames(got)
+		assert.Equal(t, []string{"static", "tool_search"}, names)
+	})
+
+	t.Run("removeTool", func(t *testing.T) {
+		tools := []*schema.ToolInfo{ti("a", "A"), ti("b", "B"), ti("c", "C")}
+		got := removeTool(tools, "b")
+		names := toolNames(got)
+		assert.Equal(t, []string{"a", "c"}, names)
+	})
+
+	t.Run("toolNameSet", func(t *testing.T) {
+		tools := []*schema.ToolInfo{ti("x", "X"), ti("y", "Y")}
+		got := toolNameSet(tools)
+		assert.True(t, got["x"])
+		assert.True(t, got["y"])
+		assert.False(t, got["z"])
+	})
+}
+
+// ---------------------------------------------------------------------------
+// TestBeforeModelRewriteState — direct unit tests for BeforeModelRewriteState
+// ---------------------------------------------------------------------------
+
+// Note: these tests call BeforeModelRewriteState without a full compose context,
+// so RunLocalValue (used by isInitialized/markInitialized) always returns error.
+// This means every call re-runs the initialization block. Tests are designed
+// accordingly: they test single-call behavior or provide pre-initialized state.
+
+func TestBeforeModelRewriteState_Mode1_Initialization(t *testing.T) {
+	ctx := context.Background()
+
+	dynamicA := &simpleTool{name: "dynamic_tool_a", desc: "Dynamic tool A"}
+	dynamicB := &simpleTool{name: "dynamic_tool_b", desc: "Dynamic tool B"}
+
+	mw, err := New(ctx, &Config{
+		DynamicTools:       []tool.BaseTool{dynamicA, dynamicB},
+		UseModelToolSearch: false,
+	})
+	require.NoError(t, err)
+
+	m := mw.(*typedMiddleware[*schema.Message])
+
+	// Simulate state: static_tool + tool_search + dynamic tools (as would come from backfill).
+	state := &adk.ChatModelAgentState{
+		Messages: []*schema.Message{
+			{Role: schema.System, Content: "sys"},
+			{Role: schema.User, Content: "hello"},
+		},
+		ToolInfos: []*schema.ToolInfo{
+			ti("static_tool", "Static tool"),
+			getToolSearchToolInfo(),
+			ti("dynamic_tool_a", "Dynamic tool A"),
+			ti("dynamic_tool_b", "Dynamic tool B"),
+		},
+	}
+
+	// Initialization strips dynamic tools, keeps tool_search and static tools.
+	_, state, err = m.BeforeModelRewriteState(ctx, state, nil)
+	require.NoError(t, err)
+
+	names := toolNames(state.ToolInfos)
+	assert.Equal(t, []string{"static_tool", "tool_search"}, names)
+	assert.Nil(t, state.DeferredToolInfos, "Mode 1 should not populate DeferredToolInfos")
+
+	// Verify reminder was inserted.
+	assert.Equal(t, 1, countReminders(state.Messages), "reminder should be inserted")
+}
+
+func TestBeforeModelRewriteState_Mode1_ForwardSelection(t *testing.T) {
+	ctx := context.Background()
+
+	dynamicA := &simpleTool{name: "dynamic_tool_a", desc: "Dynamic tool A"}
+	dynamicB := &simpleTool{name: "dynamic_tool_b", desc: "Dynamic tool B"}
+
+	mw, err := New(ctx, &Config{
+		DynamicTools:       []tool.BaseTool{dynamicA, dynamicB},
+		UseModelToolSearch: false,
+	})
+	require.NoError(t, err)
+
+	m := mw.(*typedMiddleware[*schema.Message])
+
+	// Simulate state AFTER initialization (dynamic tools already stripped).
+	// Include a tool_search result message that selected dynamic_tool_a.
+	toolSearchResultJSON, _ := json.Marshal(toolSearchResult{Matches: []string{"dynamic_tool_a"}})
+	state := &adk.ChatModelAgentState{
+		Messages: []*schema.Message{
+			{Role: schema.System, Content: "sys"},
+			{Role: schema.User, Content: "hello", Extra: map[string]any{toolSearchReminderExtraKey: true}},
+			schema.AssistantMessage("", []schema.ToolCall{
+				{ID: "tc1", Function: schema.FunctionCall{Name: toolSearchToolName, Arguments: `{"query":"select:dynamic_tool_a"}`}},
+			}),
+			{Role: schema.Tool, ToolName: toolSearchToolName, Content: string(toolSearchResultJSON)},
+		},
+		ToolInfos: []*schema.ToolInfo{
+			ti("static_tool", "Static tool"),
+			getToolSearchToolInfo(),
+		},
+	}
+
+	// Forward selection should add dynamic_tool_a from the tool_search result.
+	// Note: init block runs (no compose ctx) but ToolInfos has no dynamic tools to strip.
+	_, state, err = m.BeforeModelRewriteState(ctx, state, nil)
+	require.NoError(t, err)
+
+	names := toolNames(state.ToolInfos)
+	assert.Equal(t, []string{"dynamic_tool_a", "static_tool", "tool_search"}, names)
+
+	// Call again: forward selection should be idempotent (dynamic_tool_a already present).
+	_, state, err = m.BeforeModelRewriteState(ctx, state, nil)
+	require.NoError(t, err)
+
+	names = toolNames(state.ToolInfos)
+	assert.Equal(t, []string{"dynamic_tool_a", "static_tool", "tool_search"}, names)
+}
+
+func TestBeforeModelRewriteState_Mode2_DeferredToolInfos(t *testing.T) {
+	ctx := context.Background()
+
+	dynamicA := &simpleTool{name: "dynamic_tool_a", desc: "Dynamic tool A"}
+	dynamicB := &simpleTool{name: "dynamic_tool_b", desc: "Dynamic tool B"}
+
+	mw, err := New(ctx, &Config{
+		DynamicTools:       []tool.BaseTool{dynamicA, dynamicB},
+		UseModelToolSearch: true,
+	})
+	require.NoError(t, err)
+
+	m := mw.(*typedMiddleware[*schema.Message])
+
+	state := &adk.ChatModelAgentState{
+		Messages: []*schema.Message{
+			{Role: schema.User, Content: "hello"},
+		},
+		ToolInfos: []*schema.ToolInfo{
+			ti("static_tool", "Static tool"),
+			getToolSearchToolInfo(),
+			ti("dynamic_tool_a", "Dynamic tool A"),
+			ti("dynamic_tool_b", "Dynamic tool B"),
+		},
+	}
+
+	_, state, err = m.BeforeModelRewriteState(ctx, state, nil)
+	require.NoError(t, err)
+
+	// Mode 2: static tools in ToolInfos (tool_search removed), dynamic in DeferredToolInfos.
+	names := toolNames(state.ToolInfos)
+	assert.Equal(t, []string{"static_tool"}, names, "ToolInfos should only have static tools")
+
+	deferredNames := toolNames(state.DeferredToolInfos)
+	assert.Equal(t, []string{"dynamic_tool_a", "dynamic_tool_b"}, deferredNames, "DeferredToolInfos should have all dynamic tools")
+}
+
+func TestBeforeModelRewriteState_ReminderReinsertAfterRemoval(t *testing.T) {
+	ctx := context.Background()
+
+	dynamicA := &simpleTool{name: "dynamic_tool_a", desc: "Dynamic tool A"}
+
+	mw, err := New(ctx, &Config{
+		DynamicTools:       []tool.BaseTool{dynamicA},
+		UseModelToolSearch: false,
+	})
+	require.NoError(t, err)
+
+	m := mw.(*typedMiddleware[*schema.Message])
+
+	state := &adk.ChatModelAgentState{
+		Messages: []*schema.Message{
+			{Role: schema.User, Content: "hello"},
+		},
+		ToolInfos: []*schema.ToolInfo{
+			ti("static_tool", "Static tool"),
+			getToolSearchToolInfo(),
+			ti("dynamic_tool_a", "Dynamic tool A"),
+		},
+	}
+
+	// First call: reminder inserted.
+	_, state, err = m.BeforeModelRewriteState(ctx, state, nil)
+	require.NoError(t, err)
+
+	reminderCount := countReminders(state.Messages)
+	assert.Equal(t, 1, reminderCount)
+
+	// Simulate summarization removing the reminder message.
+	var msgsWithoutReminder []*schema.Message
+	for _, msg := range state.Messages {
+		isReminder := false
+		if msg.Extra != nil {
+			if v, ok := msg.Extra[toolSearchReminderExtraKey].(bool); ok && v {
+				isReminder = true
+			}
+		}
+		if !isReminder {
+			msgsWithoutReminder = append(msgsWithoutReminder, msg)
+		}
+	}
+	state.Messages = msgsWithoutReminder
+	assert.Equal(t, 0, countReminders(state.Messages), "reminder should be gone")
+
+	// Next call: reminder should be re-inserted.
+	_, state, err = m.BeforeModelRewriteState(ctx, state, nil)
+	require.NoError(t, err)
+
+	reminderCount = countReminders(state.Messages)
+	assert.Equal(t, 1, reminderCount, "reminder should be re-inserted after removal")
+}
+
+func countReminders(msgs []*schema.Message) int {
+	count := 0
+	for _, msg := range msgs {
+		if msg.Extra != nil {
+			if v, _ := msg.Extra[toolSearchReminderExtraKey].(bool); v {
+				count++
+			}
+		}
+	}
+	return count
+}
+
+// ---------------------------------------------------------------------------
+// Edge-case tests for BeforeModelRewriteState
+// ---------------------------------------------------------------------------
+
+func TestBeforeModelRewriteState_Mode1_MultipleToolSearchResultsAcrossTurns(t *testing.T) {
+	ctx := context.Background()
+
+	dynamicA := &simpleTool{name: "dynamic_tool_a", desc: "Dynamic tool A"}
+	dynamicB := &simpleTool{name: "dynamic_tool_b", desc: "Dynamic tool B"}
+	dynamicC := &simpleTool{name: "dynamic_tool_c", desc: "Dynamic tool C"}
+
+	mw, err := New(ctx, &Config{
+		DynamicTools:       []tool.BaseTool{dynamicA, dynamicB, dynamicC},
+		UseModelToolSearch: false,
+	})
+	require.NoError(t, err)
+
+	m := mw.(*typedMiddleware[*schema.Message])
+
+	// Build two separate tool_search result messages, each selecting a different tool.
+	resultA, _ := json.Marshal(toolSearchResult{Matches: []string{"dynamic_tool_a"}})
+	resultB, _ := json.Marshal(toolSearchResult{Matches: []string{"dynamic_tool_b"}})
+
+	state := &adk.ChatModelAgentState{
+		Messages: []*schema.Message{
+			{Role: schema.System, Content: "sys"},
+			{Role: schema.User, Content: "reminder", Extra: map[string]any{toolSearchReminderExtraKey: true}},
+			schema.AssistantMessage("", []schema.ToolCall{
+				{ID: "tc1", Function: schema.FunctionCall{Name: toolSearchToolName, Arguments: `{"query":"select:dynamic_tool_a"}`}},
+			}),
+			{Role: schema.Tool, ToolName: toolSearchToolName, Content: string(resultA)},
+			schema.AssistantMessage("", []schema.ToolCall{
+				{ID: "tc2", Function: schema.FunctionCall{Name: toolSearchToolName, Arguments: `{"query":"select:dynamic_tool_b"}`}},
+			}),
+			{Role: schema.Tool, ToolName: toolSearchToolName, Content: string(resultB)},
+		},
+		ToolInfos: []*schema.ToolInfo{
+			ti("static_tool", "Static tool"),
+			getToolSearchToolInfo(),
+		},
+	}
+
+	_, state, err = m.BeforeModelRewriteState(ctx, state, nil)
+	require.NoError(t, err)
+
+	names := toolNames(state.ToolInfos)
+	assert.Contains(t, names, "dynamic_tool_a", "dynamic_tool_a should be added from first tool_search result")
+	assert.Contains(t, names, "dynamic_tool_b", "dynamic_tool_b should be added from second tool_search result")
+	assert.NotContains(t, names, "dynamic_tool_c", "dynamic_tool_c was never selected")
+	assert.Contains(t, names, "static_tool", "static_tool should remain")
+	assert.Contains(t, names, "tool_search", "tool_search should remain")
+}
+
+func TestBeforeModelRewriteState_Mode1_MalformedJSONInToolSearchResult(t *testing.T) {
+	ctx := context.Background()
+
+	dynamicA := &simpleTool{name: "dynamic_tool_a", desc: "Dynamic tool A"}
+
+	mw, err := New(ctx, &Config{
+		DynamicTools:       []tool.BaseTool{dynamicA},
+		UseModelToolSearch: false,
+	})
+	require.NoError(t, err)
+
+	m := mw.(*typedMiddleware[*schema.Message])
+
+	state := &adk.ChatModelAgentState{
+		Messages: []*schema.Message{
+			{Role: schema.System, Content: "sys"},
+			{Role: schema.User, Content: "reminder", Extra: map[string]any{toolSearchReminderExtraKey: true}},
+			schema.AssistantMessage("", []schema.ToolCall{
+				{ID: "tc1", Function: schema.FunctionCall{Name: toolSearchToolName, Arguments: `{"query":"select:dynamic_tool_a"}`}},
+			}),
+			{Role: schema.Tool, ToolName: toolSearchToolName, Content: `{invalid json!!!`},
+		},
+		ToolInfos: []*schema.ToolInfo{
+			ti("static_tool", "Static tool"),
+			getToolSearchToolInfo(),
+		},
+	}
+
+	_, state, err = m.BeforeModelRewriteState(ctx, state, nil)
+	require.NoError(t, err, "malformed JSON in tool_search result should not cause an error")
+
+	names := toolNames(state.ToolInfos)
+	assert.NotContains(t, names, "dynamic_tool_a", "malformed JSON result should be skipped")
+	assert.Contains(t, names, "static_tool")
+	assert.Contains(t, names, "tool_search")
+}
+
+func TestBeforeModelRewriteState_Mode1_NonExistentToolInForwardSelection(t *testing.T) {
+	ctx := context.Background()
+
+	dynamicA := &simpleTool{name: "dynamic_tool_a", desc: "Dynamic tool A"}
+
+	mw, err := New(ctx, &Config{
+		DynamicTools:       []tool.BaseTool{dynamicA},
+		UseModelToolSearch: false,
+	})
+	require.NoError(t, err)
+
+	m := mw.(*typedMiddleware[*schema.Message])
+
+	resultJSON, _ := json.Marshal(toolSearchResult{Matches: []string{"nonexistent_tool", "dynamic_tool_a"}})
+
+	state := &adk.ChatModelAgentState{
+		Messages: []*schema.Message{
+			{Role: schema.User, Content: "reminder", Extra: map[string]any{toolSearchReminderExtraKey: true}},
+			schema.AssistantMessage("", []schema.ToolCall{
+				{ID: "tc1", Function: schema.FunctionCall{Name: toolSearchToolName, Arguments: `{"query":"select:nonexistent_tool,dynamic_tool_a"}`}},
+			}),
+			{Role: schema.Tool, ToolName: toolSearchToolName, Content: string(resultJSON)},
+		},
+		ToolInfos: []*schema.ToolInfo{
+			ti("static_tool", "Static tool"),
+			getToolSearchToolInfo(),
+		},
+	}
+
+	_, state, err = m.BeforeModelRewriteState(ctx, state, nil)
+	require.NoError(t, err, "nonexistent tool in forward selection should not cause an error")
+
+	names := toolNames(state.ToolInfos)
+	assert.Contains(t, names, "dynamic_tool_a", "valid tool should be added")
+	assert.NotContains(t, names, "nonexistent_tool", "nonexistent tool should be silently ignored")
+}
+
+func TestBeforeModelRewriteState_Mode2_EmptyToolInfos(t *testing.T) {
+	ctx := context.Background()
+
+	dynamicA := &simpleTool{name: "dynamic_tool_a", desc: "Dynamic tool A"}
+
+	mw, err := New(ctx, &Config{
+		DynamicTools:       []tool.BaseTool{dynamicA},
+		UseModelToolSearch: true,
+	})
+	require.NoError(t, err)
+
+	m := mw.(*typedMiddleware[*schema.Message])
+
+	state := &adk.ChatModelAgentState{
+		Messages: []*schema.Message{
+			{Role: schema.User, Content: "hello"},
+		},
+		ToolInfos: []*schema.ToolInfo{}, // empty, not nil
+	}
+
+	_, state, err = m.BeforeModelRewriteState(ctx, state, nil)
+	require.NoError(t, err, "empty ToolInfos should not cause an error")
+
+	assert.Empty(t, state.ToolInfos, "ToolInfos should be empty")
+	assert.Empty(t, state.DeferredToolInfos, "DeferredToolInfos should be empty when no dynamic tools found in ToolInfos")
+}
+
+func TestBeforeModelRewriteState_Mode1_DoubleInitWithoutComposeContext(t *testing.T) {
+	ctx := context.Background()
+
+	dynamicA := &simpleTool{name: "dynamic_tool_a", desc: "Dynamic tool A"}
+	dynamicB := &simpleTool{name: "dynamic_tool_b", desc: "Dynamic tool B"}
+
+	mw, err := New(ctx, &Config{
+		DynamicTools:       []tool.BaseTool{dynamicA, dynamicB},
+		UseModelToolSearch: false,
+	})
+	require.NoError(t, err)
+
+	m := mw.(*typedMiddleware[*schema.Message])
+
+	resultJSON, _ := json.Marshal(toolSearchResult{Matches: []string{"dynamic_tool_a"}})
+
+	state := &adk.ChatModelAgentState{
+		Messages: []*schema.Message{
+			{Role: schema.User, Content: "reminder", Extra: map[string]any{toolSearchReminderExtraKey: true}},
+			schema.AssistantMessage("", []schema.ToolCall{
+				{ID: "tc1", Function: schema.FunctionCall{Name: toolSearchToolName, Arguments: `{"query":"select:dynamic_tool_a"}`}},
+			}),
+			{Role: schema.Tool, ToolName: toolSearchToolName, Content: string(resultJSON)},
+		},
+		ToolInfos: []*schema.ToolInfo{
+			ti("static_tool", "Static tool"),
+			getToolSearchToolInfo(),
+			ti("dynamic_tool_a", "Dynamic tool A"),
+		},
+	}
+
+	// First call: init runs (strips dynamic_tool_a), then forward selection re-adds it.
+	_, state, err = m.BeforeModelRewriteState(ctx, state, nil)
+	require.NoError(t, err)
+
+	names := toolNames(state.ToolInfos)
+	assert.Contains(t, names, "dynamic_tool_a",
+		"forward selection should re-add dynamic_tool_a even after init re-strips it")
+	assert.Contains(t, names, "static_tool")
+	assert.Contains(t, names, "tool_search")
+
+	// Second call: init runs AGAIN (no compose ctx), verify behavior is stable.
+	_, state2, err := m.BeforeModelRewriteState(ctx, state, nil)
+	require.NoError(t, err)
+
+	names2 := toolNames(state2.ToolInfos)
+	assert.Contains(t, names2, "dynamic_tool_a",
+		"second call should also have dynamic_tool_a re-added by forward selection")
+}
+
+func TestBeforeModelRewriteState_ToolInfosSliceMutation(t *testing.T) {
+	ctx := context.Background()
+
+	dynamicA := &simpleTool{name: "dynamic_tool_a", desc: "Dynamic tool A"}
+
+	mw, err := New(ctx, &Config{
+		DynamicTools:       []tool.BaseTool{dynamicA},
+		UseModelToolSearch: false,
+	})
+	require.NoError(t, err)
+
+	m := mw.(*typedMiddleware[*schema.Message])
+
+	// Create ToolInfos with excess capacity so append could mutate in place.
+	originalToolInfos := make([]*schema.ToolInfo, 2, 10)
+	originalToolInfos[0] = ti("static_tool", "Static tool")
+	originalToolInfos[1] = getToolSearchToolInfo()
+
+	originalLen := len(originalToolInfos)
+
+	resultJSON, _ := json.Marshal(toolSearchResult{Matches: []string{"dynamic_tool_a"}})
+
+	state := &adk.ChatModelAgentState{
+		Messages: []*schema.Message{
+			{Role: schema.User, Content: "reminder", Extra: map[string]any{toolSearchReminderExtraKey: true}},
+			schema.AssistantMessage("", []schema.ToolCall{
+				{ID: "tc1", Function: schema.FunctionCall{Name: toolSearchToolName, Arguments: `{"query":"select:dynamic_tool_a"}`}},
+			}),
+			{Role: schema.Tool, ToolName: toolSearchToolName, Content: string(resultJSON)},
+		},
+		ToolInfos: originalToolInfos,
+	}
+
+	_, newState, err := m.BeforeModelRewriteState(ctx, state, nil)
+	require.NoError(t, err)
+
+	newNames := toolNames(newState.ToolInfos)
+	assert.Contains(t, newNames, "dynamic_tool_a")
+	assert.Equal(t, originalLen, len(originalToolInfos),
+		"original ToolInfos slice length should not be mutated by the middleware")
+}
+
+// ---------------------------------------------------------------------------
+// modelToolSearchTool (Mode 2) tests
+// ---------------------------------------------------------------------------
+
+func TestModelToolSearchTool(t *testing.T) {
+	ctx := context.Background()
+
+	tools := makeToolMap(
+		ti("alpha", "Alpha tool description"),
+		ti("beta", "Beta tool description"),
+	)
+	mts := &modelToolSearchTool{tools: tools}
+
+	// Info should return the standard tool_search tool info.
+	info, err := mts.Info(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, toolSearchToolName, info.Name)
+
+	// InvokableRun with a valid query selecting "alpha".
+	arg := &schema.ToolArgument{Text: searchJSON("select:alpha", nil)}
+	result, err := mts.InvokableRun(ctx, arg)
+	require.NoError(t, err)
+	require.Len(t, result.Parts, 1)
+	assert.Equal(t, schema.ToolPartTypeToolSearchResult, result.Parts[0].Type)
+	require.NotNil(t, result.Parts[0].ToolSearchResult)
+	assert.Len(t, result.Parts[0].ToolSearchResult.Tools, 1)
+	assert.Equal(t, "alpha", result.Parts[0].ToolSearchResult.Tools[0].Name)
+
+	// InvokableRun with an empty query should return error.
+	argEmpty := &schema.ToolArgument{Text: `{"query":""}`}
+	_, err = mts.InvokableRun(ctx, argEmpty)
+	assert.Error(t, err)
+}
+
+func TestNewTypedAgenticMessage(t *testing.T) {
+	ctx := context.Background()
+
+	// Verify that NewTyped compiles with *schema.AgenticMessage.
+	// DynamicTools is required, so we expect an error with an empty config.
+	mw, err := NewTyped[*schema.AgenticMessage](ctx, &Config{
+		DynamicTools: []tool.BaseTool{&simpleTool{name: "t1", desc: "desc1"}},
+	})
 	assert.NoError(t, err)
-	assert.Equal(t, "tool_search", info.Name)
-	assert.Contains(t, info.Desc, "regex pattern")
-	assert.NotNil(t, info.ParamsOneOf)
-}
+	assert.NotNil(t, mw)
 
-func TestToolSearchTool_InvokableRun(t *testing.T) {
-	ctx := context.Background()
-	toolNames := []string{"get_weather", "get_time", "search_web", "calculate_sum"}
-	tst := newToolSearchTool(toolNames)
-
-	t.Run("empty regex pattern returns error", func(t *testing.T) {
-		args := `{"regex_pattern": ""}`
-		result, err := tst.InvokableRun(ctx, args)
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "regex_pattern is required")
-		assert.Empty(t, result)
-	})
-
-	t.Run("invalid json returns error", func(t *testing.T) {
-		args := `{invalid json}`
-		result, err := tst.InvokableRun(ctx, args)
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "failed to unmarshal")
-		assert.Empty(t, result)
-	})
-
-	t.Run("invalid regex returns error", func(t *testing.T) {
-		args := `{"regex_pattern": "[invalid"}`
-		result, err := tst.InvokableRun(ctx, args)
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "invalid regex pattern")
-		assert.Empty(t, result)
-	})
-
-	t.Run("matches tools with prefix pattern", func(t *testing.T) {
-		args := `{"regex_pattern": "^get_"}`
-		result, err := tst.InvokableRun(ctx, args)
-		assert.NoError(t, err)
-
-		var res toolSearchResult
-		err = json.Unmarshal([]byte(result), &res)
-		assert.NoError(t, err)
-		assert.ElementsMatch(t, []string{"get_weather", "get_time"}, res.SelectedTools)
-	})
-
-	t.Run("matches tools with suffix pattern", func(t *testing.T) {
-		args := `{"regex_pattern": "_sum$"}`
-		result, err := tst.InvokableRun(ctx, args)
-		assert.NoError(t, err)
-
-		var res toolSearchResult
-		err = json.Unmarshal([]byte(result), &res)
-		assert.NoError(t, err)
-		assert.ElementsMatch(t, []string{"calculate_sum"}, res.SelectedTools)
-	})
-
-	t.Run("matches all tools with wildcard", func(t *testing.T) {
-		args := `{"regex_pattern": ".*"}`
-		result, err := tst.InvokableRun(ctx, args)
-		assert.NoError(t, err)
-
-		var res toolSearchResult
-		err = json.Unmarshal([]byte(result), &res)
-		assert.NoError(t, err)
-		assert.ElementsMatch(t, toolNames, res.SelectedTools)
-	})
-
-	t.Run("no matches returns empty list", func(t *testing.T) {
-		args := `{"regex_pattern": "^nonexistent_"}`
-		result, err := tst.InvokableRun(ctx, args)
-		assert.NoError(t, err)
-
-		var res toolSearchResult
-		err = json.Unmarshal([]byte(result), &res)
-		assert.NoError(t, err)
-		assert.Empty(t, res.SelectedTools)
-	})
-}
-
-func TestGetToolNames(t *testing.T) {
-	ctx := context.Background()
-
-	t.Run("returns tool names", func(t *testing.T) {
-		tools := []tool.BaseTool{
-			newMockTool("tool1", "desc1"),
-			newMockTool("tool2", "desc2"),
-			newMockTool("tool3", "desc3"),
-		}
-		names, err := getToolNames(ctx, tools)
-		assert.NoError(t, err)
-		assert.Equal(t, []string{"tool1", "tool2", "tool3"}, names)
-	})
-
-	t.Run("empty tools returns empty slice", func(t *testing.T) {
-		names, err := getToolNames(ctx, []tool.BaseTool{})
-		assert.NoError(t, err)
-		assert.Empty(t, names)
-	})
-}
-
-func TestExtractSelectedTools(t *testing.T) {
-	ctx := context.Background()
-
-	t.Run("extracts selected tools from messages", func(t *testing.T) {
-		result := toolSearchResult{SelectedTools: []string{"tool1", "tool2"}}
-		resultJSON, _ := json.Marshal(result)
-
-		messages := []*schema.Message{
-			schema.UserMessage("hello"),
-			{Role: schema.Tool, ToolName: toolSearchToolName, Content: string(resultJSON)},
-		}
-
-		selected, err := extractSelectedTools(ctx, messages)
-		assert.NoError(t, err)
-		assert.ElementsMatch(t, []string{"tool1", "tool2"}, selected)
-	})
-
-	t.Run("handles multiple tool_search results", func(t *testing.T) {
-		result1 := toolSearchResult{SelectedTools: []string{"tool1"}}
-		result1JSON, _ := json.Marshal(result1)
-		result2 := toolSearchResult{SelectedTools: []string{"tool2", "tool3"}}
-		result2JSON, _ := json.Marshal(result2)
-
-		messages := []*schema.Message{
-			{Role: schema.Tool, ToolName: toolSearchToolName, Content: string(result1JSON)},
-			schema.UserMessage("continue"),
-			{Role: schema.Tool, ToolName: toolSearchToolName, Content: string(result2JSON)},
-		}
-
-		selected, err := extractSelectedTools(ctx, messages)
-		assert.NoError(t, err)
-		assert.ElementsMatch(t, []string{"tool1", "tool2", "tool3"}, selected)
-	})
-
-	t.Run("ignores non-tool_search messages", func(t *testing.T) {
-		messages := []*schema.Message{
-			schema.UserMessage("hello"),
-			{Role: schema.Tool, ToolName: "other_tool", Content: "some content"},
-			{Role: schema.Assistant, Content: "response"},
-		}
-
-		selected, err := extractSelectedTools(ctx, messages)
-		assert.NoError(t, err)
-		assert.Empty(t, selected)
-	})
-
-	t.Run("returns error for invalid json", func(t *testing.T) {
-		messages := []*schema.Message{
-			{Role: schema.Tool, ToolName: toolSearchToolName, Content: "invalid json"},
-		}
-
-		selected, err := extractSelectedTools(ctx, messages)
-		assert.Error(t, err)
-		assert.Nil(t, selected)
-	})
-}
-
-func TestInvertSelect(t *testing.T) {
-	t.Run("returns items not in selected", func(t *testing.T) {
-		all := []string{"a", "b", "c", "d"}
-		selected := []string{"b", "d"}
-
-		result := invertSelect(all, selected)
-		assert.Len(t, result, 2)
-		_, hasA := result["a"]
-		_, hasC := result["c"]
-		assert.True(t, hasA)
-		assert.True(t, hasC)
-	})
-
-	t.Run("empty selected returns all", func(t *testing.T) {
-		all := []string{"a", "b", "c"}
-		selected := []string{}
-
-		result := invertSelect(all, selected)
-		assert.Len(t, result, 3)
-	})
-
-	t.Run("all selected returns empty", func(t *testing.T) {
-		all := []string{"a", "b"}
-		selected := []string{"a", "b"}
-
-		result := invertSelect(all, selected)
-		assert.Empty(t, result)
-	})
-
-	t.Run("works with integers", func(t *testing.T) {
-		all := []int{1, 2, 3, 4, 5}
-		selected := []int{2, 4}
-
-		result := invertSelect(all, selected)
-		assert.Len(t, result, 3)
-		_, has1 := result[1]
-		_, has3 := result[3]
-		_, has5 := result[5]
-		assert.True(t, has1)
-		assert.True(t, has3)
-		assert.True(t, has5)
-	})
-}
-
-func TestRemoveTools(t *testing.T) {
-	ctx := context.Background()
-
-	t.Run("removes unselected dynamic tools", func(t *testing.T) {
-		allTools := []*schema.ToolInfo{
-			{Name: "static_tool"},
-			{Name: "dynamic_tool1"},
-			{Name: "dynamic_tool2"},
-			{Name: "dynamic_tool3"},
-		}
-
-		dynamicTools := []tool.BaseTool{
-			newMockTool("dynamic_tool1", ""),
-			newMockTool("dynamic_tool2", ""),
-			newMockTool("dynamic_tool3", ""),
-		}
-
-		result := toolSearchResult{SelectedTools: []string{"dynamic_tool1"}}
-		resultJSON, _ := json.Marshal(result)
-		messages := []*schema.Message{
-			{Role: schema.Tool, ToolName: toolSearchToolName, Content: string(resultJSON)},
-		}
-
-		tools, err := removeTools(ctx, allTools, dynamicTools, messages)
-		assert.NoError(t, err)
-		assert.Len(t, tools, 2)
-
-		toolNames := make([]string, len(tools))
-		for i, t := range tools {
-			toolNames[i] = t.Name
-		}
-		assert.ElementsMatch(t, []string{"static_tool", "dynamic_tool1"}, toolNames)
-	})
-
-	t.Run("remove all dynamic tools when no tool_search result", func(t *testing.T) {
-		allTools := []*schema.ToolInfo{
-			{Name: "static_tool"},
-			{Name: "dynamic_tool1"},
-		}
-
-		dynamicTools := []tool.BaseTool{
-			newMockTool("dynamic_tool1", ""),
-		}
-
-		messages := []*schema.Message{
-			schema.UserMessage("hello"),
-		}
-
-		tools, err := removeTools(ctx, allTools, dynamicTools, messages)
-		assert.NoError(t, err)
-		assert.Len(t, tools, 1)
-		assert.Equal(t, "static_tool", tools[0].Name)
-	})
-
-	t.Run("handles empty dynamic tools", func(t *testing.T) {
-		allTools := []*schema.ToolInfo{
-			{Name: "static_tool1"},
-			{Name: "static_tool2"},
-		}
-
-		dynamicTools := []tool.BaseTool{}
-		messages := []*schema.Message{}
-
-		tools, err := removeTools(ctx, allTools, dynamicTools, messages)
-		assert.NoError(t, err)
-		assert.Len(t, tools, 2)
-	})
-}
-
-type mockChatModel struct {
-	generateFunc func(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.Message, error)
-	streamFunc   func(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error)
-}
-
-func (m *mockChatModel) Generate(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.Message, error) {
-	if m.generateFunc != nil {
-		return m.generateFunc(ctx, input, opts...)
-	}
-	return &schema.Message{Role: schema.Assistant, Content: "response"}, nil
-}
-
-func (m *mockChatModel) Stream(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
-	if m.streamFunc != nil {
-		return m.streamFunc(ctx, input, opts...)
-	}
-	return nil, nil
-}
-
-func TestWrapper_Generate(t *testing.T) {
-	ctx := context.Background()
-
-	t.Run("filters tools based on tool_search result", func(t *testing.T) {
-		allTools := []*schema.ToolInfo{
-			{Name: "static_tool"},
-			{Name: "dynamic_tool1"},
-			{Name: "dynamic_tool2"},
-		}
-
-		dynamicTools := []tool.BaseTool{
-			newMockTool("dynamic_tool1", ""),
-			newMockTool("dynamic_tool2", ""),
-		}
-
-		result := toolSearchResult{SelectedTools: []string{"dynamic_tool1"}}
-		resultJSON, _ := json.Marshal(result)
-
-		messages := []*schema.Message{
-			schema.UserMessage("hello"),
-			{Role: schema.Tool, ToolName: toolSearchToolName, Content: string(resultJSON)},
-		}
-
-		w := &wrapper{
-			allTools:     allTools,
-			dynamicTools: dynamicTools,
-			cm: &mockChatModel{
-				generateFunc: func(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.Message, error) {
-					options := model.GetCommonOptions(nil, opts...)
-					assert.Len(t, options.Tools, 2)
-					assert.Equal(t, "static_tool", options.Tools[0].Name)
-					assert.Equal(t, "dynamic_tool1", options.Tools[1].Name)
-					return nil, nil
-				},
-			},
-		}
-
-		_, err := w.Generate(ctx, messages)
-		assert.NoError(t, err)
-	})
-}
-
-func TestWrapper_Stream(t *testing.T) {
-	ctx := context.Background()
-
-	t.Run("filters tools based on tool_search result", func(t *testing.T) {
-		allTools := []*schema.ToolInfo{
-			{Name: "static_tool"},
-			{Name: "dynamic_tool1"},
-			{Name: "dynamic_tool2"},
-		}
-
-		dynamicTools := []tool.BaseTool{
-			newMockTool("dynamic_tool1", ""),
-			newMockTool("dynamic_tool2", ""),
-		}
-
-		result := toolSearchResult{SelectedTools: []string{"dynamic_tool1"}}
-		resultJSON, _ := json.Marshal(result)
-
-		messages := []*schema.Message{
-			schema.UserMessage("hello"),
-			{Role: schema.Tool, ToolName: toolSearchToolName, Content: string(resultJSON)},
-		}
-
-		w := &wrapper{
-			allTools:     allTools,
-			dynamicTools: dynamicTools,
-			cm: &mockChatModel{
-				streamFunc: func(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
-					options := model.GetCommonOptions(nil, opts...)
-					assert.Len(t, options.Tools, 2)
-					assert.Equal(t, "static_tool", options.Tools[0].Name)
-					assert.Equal(t, "dynamic_tool1", options.Tools[1].Name)
-					return nil, nil
-				},
-			},
-		}
-
-		stream, err := w.Stream(ctx, messages)
-		assert.NoError(t, err)
-		assert.Nil(t, stream)
-	})
+	var _ adk.TypedChatModelAgentMiddleware[*schema.AgenticMessage] = mw
 }

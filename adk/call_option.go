@@ -24,6 +24,7 @@ type options struct {
 	checkPointID         *string
 	skipTransferMessages bool
 	handlers             []callbacks.Handler
+	cancelCtx            *cancelContext
 }
 
 // AgentRunOption is the call option for adk Agent.
@@ -55,6 +56,10 @@ func WithSessionValues(v map[string]any) AgentRunOption {
 }
 
 // WithSkipTransferMessages disables forwarding transfer messages during execution.
+//
+// NOT RECOMMENDED: Agent transfer with full context sharing between agents has not proven
+// to be more effective empirically. Consider using ChatModelAgent with AgentTool
+// or DeepAgent instead for most multi-agent scenarios.
 func WithSkipTransferMessages() AgentRunOption {
 	return WrapImplSpecificOptFn(func(t *options) {
 		t.skipTransferMessages = true
@@ -150,6 +155,33 @@ func filterCallbackHandlersForNestedAgents(currentAgentName string, opts []Agent
 				if matched {
 					continue
 				}
+			}
+		}
+		filteredOpts = append(filteredOpts, opt)
+	}
+	return filteredOpts
+}
+
+// filterCancelOption removes any AgentRunOption that sets a cancelCtx on *options.
+// This prevents inner (nested) agents from receiving the cancel option when the
+// outer flowAgent owns the cancel lifecycle. Inner agents access the cancelContext
+// via the Go context (getCancelContext) instead.
+func filterCancelOption(opts []AgentRunOption) []AgentRunOption {
+	if len(opts) == 0 {
+		return nil
+	}
+	var filteredOpts []AgentRunOption
+	for i := range opts {
+		opt := opts[i]
+		if opt.implSpecificOptFn == nil {
+			filteredOpts = append(filteredOpts, opt)
+			continue
+		}
+		if _, isCommonOpt := opt.implSpecificOptFn.(func(*options)); isCommonOpt {
+			testOpt := &options{}
+			opt.implSpecificOptFn.(func(*options))(testOpt)
+			if testOpt.cancelCtx != nil {
+				continue
 			}
 		}
 		filteredOpts = append(filteredOpts, opt)

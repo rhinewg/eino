@@ -14,29 +14,14 @@
  * limitations under the License.
  */
 
-package adk
+// Package claude defines constants for claude.
+package claude
 
-import (
-	"context"
+type TextCitationType string
+
+const (
+	TextCitationTypeCharLocation            TextCitationType = "char_location"
+	TextCitationTypePageLocation            TextCitationType = "page_location"
+	TextCitationTypeContentBlockLocation    TextCitationType = "content_block_location"
+	TextCitationTypeWebSearchResultLocation TextCitationType = "web_search_result_location"
 )
-
-type mockAgentForOption struct {
-	opts []AgentRunOption
-
-	options *options
-}
-
-func (m *mockAgentForOption) Name(ctx context.Context) string {
-	return "agent_1"
-}
-
-func (m *mockAgentForOption) Description(ctx context.Context) string {
-	return ""
-}
-
-func (m *mockAgentForOption) Run(ctx context.Context, input *AgentInput, opts ...AgentRunOption) *AsyncIterator[*AgentEvent] {
-	m.opts = opts
-	m.options = getCommonOptions(&options{}, opts...)
-
-	return nil
-}

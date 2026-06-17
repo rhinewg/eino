@@ -17,15 +17,19 @@
 package adk
 
 import (
+	"bytes"
 	"context"
+	"encoding/gob"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"testing"
 
 	"github.com/bytedance/sonic"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 
 	"github.com/cloudwego/eino/components/model"
@@ -37,6 +41,43 @@ import (
 
 type testModelWrapper struct {
 	inner model.ToolCallingChatModel
+}
+
+func TestStateCompatConversions_V080(t *testing.T) {
+	t.Run("stateV080GobDecodeAndToState", func(t *testing.T) {
+		ss := &stateV080Serialization{
+			ReturnDirectlyToolCallID: "tcid",
+			RemainingIterations:      2,
+			Internals: map[string]any{
+				"_retryAttempt":        9,
+				"_returnDirectlyEvent": &AgentEvent{AgentName: "agent"},
+			},
+		}
+
+		var buf bytes.Buffer
+		assert.NoError(t, gob.NewEncoder(&buf).Encode(ss))
+
+		var legacy stateV080
+		assert.NoError(t, legacy.GobDecode(buf.Bytes()))
+
+		s := stateV080ToState(&legacy)
+		assert.Equal(t, "tcid", s.ReturnDirectlyToolCallID)
+		assert.True(t, s.HasReturnDirectly)
+		assert.Equal(t, 2, s.RemainingIterations)
+		assert.Equal(t, 9, s.RetryAttempt)
+		assert.NotNil(t, s.ReturnDirectlyEvent)
+		assert.Equal(t, "agent", s.ReturnDirectlyEvent.AgentName)
+	})
+}
+
+func TestStateGetToolGenActions(t *testing.T) {
+	st := &State{
+		ToolGenActions: map[string]*AgentAction{
+			"k": {},
+		},
+	}
+	assert.NotNil(t, st.getToolGenActions())
+	assert.Contains(t, st.getToolGenActions(), "k")
 }
 
 func (w *testModelWrapper) Generate(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.Message, error) {
@@ -109,12 +150,12 @@ func TestReact(t *testing.T) {
 		assert.NoError(t, err)
 		assert.NotNil(t, graph)
 
-		compiled, err := graph.Compile(ctx)
+		compiled, err := graph.Compile(ctx, compose.WithMaxRunSteps(math.MaxInt))
 		assert.NoError(t, err)
 		assert.NotNil(t, compiled)
 
 		// Test with a user message
-		result, err := compiled.Invoke(ctx, &reactInput{messages: []Message{
+		result, err := compiled.Invoke(ctx, &reactInput{Messages: []Message{
 			{
 				Role:    schema.User,
 				Content: "Use the test tool to say hello",
@@ -176,12 +217,12 @@ func TestReact(t *testing.T) {
 		assert.NoError(t, err)
 		assert.NotNil(t, graph)
 
-		compiled, err := graph.Compile(ctx)
+		compiled, err := graph.Compile(ctx, compose.WithMaxRunSteps(math.MaxInt))
 		assert.NoError(t, err)
 		assert.NotNil(t, compiled)
 
 		// Test with a user message when tool returns directly
-		result, err := compiled.Invoke(ctx, &reactInput{messages: []Message{
+		result, err := compiled.Invoke(ctx, &reactInput{Messages: []Message{
 			{
 				Role:    schema.User,
 				Content: "Use the test tool to say hello",
@@ -268,12 +309,12 @@ func TestReact(t *testing.T) {
 		assert.NoError(t, err)
 		assert.NotNil(t, graph)
 
-		compiled, err := graph.Compile(ctx)
+		compiled, err := graph.Compile(ctx, compose.WithMaxRunSteps(math.MaxInt))
 		assert.NoError(t, err)
 		assert.NotNil(t, compiled)
 
 		// Test streaming with a user message
-		outStream, err := compiled.Stream(ctx, &reactInput{messages: []Message{
+		outStream, err := compiled.Stream(ctx, &reactInput{Messages: []Message{
 			{
 				Role:    schema.User,
 				Content: "Use the test tool to say hello",
@@ -378,7 +419,7 @@ func TestReact(t *testing.T) {
 		assert.NoError(t, err)
 		assert.NotNil(t, graph)
 
-		compiled, err := graph.Compile(ctx)
+		compiled, err := graph.Compile(ctx, compose.WithMaxRunSteps(math.MaxInt))
 		assert.NoError(t, err)
 		assert.NotNil(t, compiled)
 
@@ -386,7 +427,7 @@ func TestReact(t *testing.T) {
 		times = 0
 
 		// Test streaming with a user message when tool returns directly
-		outStream, err := compiled.Stream(ctx, &reactInput{messages: []Message{
+		outStream, err := compiled.Stream(ctx, &reactInput{Messages: []Message{
 			{
 				Role:    schema.User,
 				Content: "Use the test tool to say hello",
@@ -467,12 +508,12 @@ func TestReact(t *testing.T) {
 		assert.NoError(t, err)
 		assert.NotNil(t, graph)
 
-		compiled, err := graph.Compile(ctx)
+		compiled, err := graph.Compile(ctx, compose.WithMaxRunSteps(math.MaxInt))
 		assert.NoError(t, err)
 		assert.NotNil(t, compiled)
 
 		// Test with a user message
-		result, err := compiled.Invoke(ctx, &reactInput{messages: []Message{
+		result, err := compiled.Invoke(ctx, &reactInput{Messages: []Message{
 			{
 				Role:    schema.User,
 				Content: "Use the test tool to say hello",
@@ -497,12 +538,12 @@ func TestReact(t *testing.T) {
 		assert.NoError(t, err)
 		assert.NotNil(t, graph)
 
-		compiled, err = graph.Compile(ctx)
+		compiled, err = graph.Compile(ctx, compose.WithMaxRunSteps(math.MaxInt))
 		assert.NoError(t, err)
 		assert.NotNil(t, compiled)
 
 		// Test with a user message
-		result, err = compiled.Invoke(ctx, &reactInput{messages: []Message{
+		_, err = compiled.Invoke(ctx, &reactInput{Messages: []Message{
 			{
 				Role:    schema.User,
 				Content: "Use the test tool to say hello",
@@ -601,4 +642,31 @@ func randStrForTest() string {
 		b[i] = seeds[rand.Intn(len(seeds))]
 	}
 	return string(b)
+}
+
+func TestReactHistory_EmptyMessages(t *testing.T) {
+	g := compose.NewGraph[string, []Message](compose.WithGenLocalState(func(ctx context.Context) (state *State) {
+		return &State{
+			Messages: []Message{},
+		}
+	}))
+	require.NoError(t, g.AddLambdaNode("1", compose.InvokableLambda(func(ctx context.Context, input string) (output []Message, err error) {
+		return getReactChatHistory(ctx, "DestAgent")
+	})))
+	require.NoError(t, g.AddEdge(compose.START, "1"))
+	require.NoError(t, g.AddEdge("1", compose.END))
+
+	ctx := context.Background()
+	ctx, _ = initRunCtx(ctx, "MyAgent", nil)
+	runner, err := g.Compile(ctx)
+	require.NoError(t, err)
+
+	require.NotPanics(t, func() {
+		result, err := runner.Invoke(ctx, "")
+		if err != nil {
+			t.Logf("Got error (acceptable): %v", err)
+			return
+		}
+		t.Logf("Got %d messages", len(result))
+	}, "BUG: getReactChatHistory should not panic with empty Messages slice")
 }
